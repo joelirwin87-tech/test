@@ -255,144 +255,6 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
-def _prepare_metadata_frame(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Return a normalized metadata frame with consistent columns."""
-
-    base = df.copy() if df is not None else get_metadata().copy()
-
-    if "ticker" not in base.columns:
-        base["ticker"] = ""
-
-    optional_columns = ["name", "sector", "market_cap_billion", "exchange", "type"]
-    for column in optional_columns:
-        if column not in base.columns:
-            base[column] = np.nan
-
-    base["ticker"] = base["ticker"].fillna("").astype(str).str.strip().str.upper()
-    base = base[base["ticker"].astype(bool)]
-    base["sector"] = base["sector"].fillna("Unknown")
-    base["market_cap_billion"] = pd.to_numeric(
-        base["market_cap_billion"], errors="coerce"
-    )
-
-    base = base.drop_duplicates("ticker")
-    return base.set_index("ticker", drop=False)
-
-
-def _empty_metadata_frame() -> pd.DataFrame:
-    """Return an empty metadata frame with standardized columns."""
-
-    columns = ["ticker", "name", "sector", "market_cap_billion", "exchange", "type"]
-    return _prepare_metadata_frame(pd.DataFrame(columns=columns))
-
-
-def _to_billion(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-    return number / 1_000_000_000 if np.isfinite(number) else float("nan")
-
-
-def _normalize_discovery_records(
-    records: Optional[Iterable[Dict[str, object]]],
-    *,
-    default_sector: str = "Unknown",
-) -> pd.DataFrame:
-    """Normalise ticker discovery payloads into the metadata schema."""
-
-    normalized: List[Dict[str, object]] = []
-    if records:
-        for record in records:
-            symbol = str(
-                (record.get("symbol") or record.get("ticker") or "")
-            ).strip().upper()
-            if not symbol:
-                continue
-            normalized.append(
-                {
-                    "ticker": symbol,
-                    "name": record.get("shortname")
-                    or record.get("longname")
-                    or record.get("name"),
-                    "exchange": record.get("exchange")
-                    or record.get("fullExchangeName")
-                    or record.get("exchDisp"),
-                    "type": record.get("quoteType")
-                    or record.get("typeDisp")
-                    or record.get("type"),
-                    "sector": record.get("sector") or default_sector,
-                    "market_cap_billion": _to_billion(record.get("marketCap")),
-                }
-            )
-
-    if not normalized:
-        return _empty_metadata_frame()
-
-    return _prepare_metadata_frame(pd.DataFrame.from_records(normalized))
-
-
-@st.cache_data(show_spinner=False)
-def search_ticker_universe(
-    query: str,
-    *,
-    max_results: int = 25,
-    news_count: int = 0,
-) -> pd.DataFrame:
-    """Discover tickers via Yahoo Finance Search."""
-
-    if not query.strip():
-        return _empty_metadata_frame()
-
-    try:
-        search_client = yf.Search(query.strip(), max_results=max_results, news_count=news_count)
-        quotes = getattr(search_client, "quotes", None)
-    except Exception as err:  # pragma: no cover - network dependent
-        raise RuntimeError(f"Search failed: {err}") from err
-
-    return _normalize_discovery_records(quotes)
-
-
-LOOKUP_CATEGORIES = {
-    "All": "get_all",
-    "Stock": "get_stock",
-    "Mutual Fund": "get_mutualfund",
-    "ETF": "get_etf",
-    "Index": "get_index",
-    "Future": "get_future",
-    "Currency": "get_currency",
-    "Cryptocurrency": "get_cryptocurrency",
-}
-
-
-@st.cache_data(show_spinner=False)
-def lookup_ticker_universe(
-    query: str,
-    *,
-    category: str = "All",
-    count: int = 25,
-) -> pd.DataFrame:
-    """Discover tickers via Yahoo Finance Lookup."""
-
-    if not query.strip():
-        return _empty_metadata_frame()
-
-    method_name = LOOKUP_CATEGORIES.get(category, "get_all")
-
-    try:
-        client = yf.Lookup(query.strip())
-        method = getattr(client, method_name, None)
-        if callable(method):
-            records = method(count=count)
-        else:
-            fallback = getattr(client, category.lower(), None)
-            records = fallback if fallback is not None else client.all
-    except Exception as err:  # pragma: no cover - network dependent
-        raise RuntimeError(f"Lookup failed: {err}") from err
-
-    return _normalize_discovery_records(records)
-
-
 def _call_with_optional_repair(
     func: Callable[..., pd.DataFrame],
     *,
@@ -556,7 +418,7 @@ def golden_cross_strategy(
     last_signal: Optional[str] = None
     last_signal_date: Optional[pd.Timestamp] = None
 
-    equity = pd.Series(1.0, index=df.index, dtype=float)
+    equity = pd.Series(np.nan, index=df.index, dtype=float)
     current_equity = 1.0
     entry_equity: Optional[float] = None
 
@@ -665,14 +527,13 @@ def scan_tickers(
     price_fetcher: Optional[
         Callable[[str, date | datetime | pd.Timestamp], pd.DataFrame]
     ] = None,
-    metadata: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run the strategy for each ticker and build summary tables."""
 
     if profit_target <= 0:
         raise ValueError("profit_target must be positive")
 
-    normalized_start: date
+    normalized_start: Optional[date]
     if isinstance(start_date, datetime):
         normalized_start = start_date.date()
     elif isinstance(start_date, pd.Timestamp):
@@ -687,13 +548,7 @@ def scan_tickers(
 
     start_date = normalized_start
 
-    filtered_tickers = [
-        ticker for ticker in tickers if isinstance(ticker, str) and ticker.strip()
-    ]
-    if not filtered_tickers:
-        return pd.DataFrame(), pd.DataFrame()
-
-    metadata_df = _prepare_metadata_frame(metadata)
+    metadata = get_metadata()
     fetcher = price_fetcher or fetch_price_history
     signals_rows: List[Dict[str, object]] = []
     history_rows: List[Dict[str, object]] = []
@@ -952,37 +807,12 @@ def build_streamlit_app() -> None:
         if isinstance(ticker, str) and ticker.strip()
     ]
 
-    if not tickers_to_scan:
-        if ticker_source == "ASX200 Universe":
-            st.warning(
-                "No valid tickers remain after applying the current filters. "
-                "Adjust your selections or provide a custom ticker."
-            )
-        elif ticker_source == "Yahoo Finance Search" and search_query:
-            st.warning(
-                "No tickers were returned by Yahoo Finance Search. "
-                "Refine your query and try again."
-            )
-        elif ticker_source == "Yahoo Finance Lookup" and lookup_query:
-            st.warning(
-                "No tickers were returned by Yahoo Finance Lookup. "
-                "Refine your query, adjust the category, or increase the result count."
-            )
-        else:
-            st.info("Provide a query to discover tickers before running the scan.")
-
     scan_params = {
         "tickers": tuple(tickers_to_scan),
         "start": start_date.isoformat(),
         "profit_target": float(profit_target),
         "win_rate_threshold": float(win_rate_threshold),
         "cagr_threshold": float(cagr_threshold),
-        "ticker_source": ticker_source,
-        "search_query": search_query,
-        "search_results_limit": int(search_results_limit),
-        "lookup_query": lookup_query,
-        "lookup_category": lookup_category,
-        "lookup_count": int(lookup_count),
     }
     previous_params = st.session_state.get("last_scan_params")
     should_run = run_button or previous_params != scan_params
@@ -996,7 +826,6 @@ def build_streamlit_app() -> None:
                     profit_target=profit_target,
                     win_rate_threshold=win_rate_threshold,
                     cagr_threshold=cagr_threshold,
-                    metadata=filtered_metadata,
                 )
             except Exception as exc:
                 st.error(f"Unable to complete scan: {exc}")
