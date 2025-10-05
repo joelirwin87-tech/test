@@ -418,7 +418,7 @@ def golden_cross_strategy(
     last_signal: Optional[str] = None
     last_signal_date: Optional[pd.Timestamp] = None
 
-    equity = pd.Series(1.0, index=df.index, dtype=float)
+    equity = pd.Series(np.nan, index=df.index, dtype=float)
     current_equity = 1.0
     entry_equity: Optional[float] = None
 
@@ -533,7 +533,7 @@ def scan_tickers(
     if profit_target <= 0:
         raise ValueError("profit_target must be positive")
 
-    normalized_start: date
+    normalized_start: Optional[date]
     if isinstance(start_date, datetime):
         normalized_start = start_date.date()
     elif isinstance(start_date, pd.Timestamp):
@@ -547,12 +547,6 @@ def scan_tickers(
         raise ValueError("start_date cannot be in the future")
 
     start_date = normalized_start
-
-    filtered_tickers = [
-        ticker for ticker in tickers if isinstance(ticker, str) and ticker.strip()
-    ]
-    if not filtered_tickers:
-        return pd.DataFrame(), pd.DataFrame()
 
     metadata = get_metadata()
     fetcher = price_fetcher or fetch_price_history
@@ -720,12 +714,6 @@ def build_streamlit_app() -> None:
         for ticker in filtered_metadata["ticker"].tolist()
         if isinstance(ticker, str) and ticker.strip()
     ]
-
-    if not tickers_to_scan:
-        st.warning(
-            "No valid tickers remain after applying the current filters. "
-            "Adjust your selections or provide a custom ticker."
-        )
 
     scan_params = {
         "tickers": tuple(tickers_to_scan),
