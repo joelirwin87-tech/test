@@ -255,19 +255,190 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
+def _prepare_metadata_frame(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return a normalized metadata frame with consistent columns."""
+
+    base = df.copy() if df is not None else get_metadata().copy()
+
+    if "ticker" not in base.columns:
+        base["ticker"] = ""
+
+    optional_columns = ["name", "sector", "market_cap_billion", "exchange", "type"]
+    for column in optional_columns:
+        if column not in base.columns:
+            base[column] = np.nan
+
+    base["ticker"] = base["ticker"].fillna("").astype(str).str.strip().str.upper()
+    base = base[base["ticker"].astype(bool)]
+    base["sector"] = base["sector"].fillna("Unknown")
+    base["market_cap_billion"] = pd.to_numeric(
+        base["market_cap_billion"], errors="coerce"
+    )
+
+    base = base.drop_duplicates("ticker")
+    return base.set_index("ticker", drop=False)
+
+
+def _empty_metadata_frame() -> pd.DataFrame:
+    """Return an empty metadata frame with standardized columns."""
+
+    columns = ["ticker", "name", "sector", "market_cap_billion", "exchange", "type"]
+    return _prepare_metadata_frame(pd.DataFrame(columns=columns))
+
+
+def _to_billion(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number / 1_000_000_000 if np.isfinite(number) else float("nan")
+
+
+def _normalize_discovery_records(
+    records: Optional[Iterable[Dict[str, object]]],
+    *,
+    default_sector: str = "Unknown",
+) -> pd.DataFrame:
+    """Normalise ticker discovery payloads into the metadata schema."""
+
+    normalized: List[Dict[str, object]] = []
+    if records:
+        for record in records:
+            symbol = str(
+                (record.get("symbol") or record.get("ticker") or "")
+            ).strip().upper()
+            if not symbol:
+                continue
+            normalized.append(
+                {
+                    "ticker": symbol,
+                    "name": record.get("shortname")
+                    or record.get("longname")
+                    or record.get("name"),
+                    "exchange": record.get("exchange")
+                    or record.get("fullExchangeName")
+                    or record.get("exchDisp"),
+                    "type": record.get("quoteType")
+                    or record.get("typeDisp")
+                    or record.get("type"),
+                    "sector": record.get("sector") or default_sector,
+                    "market_cap_billion": _to_billion(record.get("marketCap")),
+                }
+            )
+
+    if not normalized:
+        return _empty_metadata_frame()
+
+    return _prepare_metadata_frame(pd.DataFrame.from_records(normalized))
+
+
+@st.cache_data(show_spinner=False)
+def search_ticker_universe(
+    query: str,
+    *,
+    max_results: int = 25,
+    news_count: int = 0,
+) -> pd.DataFrame:
+    """Discover tickers via Yahoo Finance Search."""
+
+    if not query.strip():
+        return _empty_metadata_frame()
+
+    try:
+        search_client = yf.Search(query.strip(), max_results=max_results, news_count=news_count)
+        quotes = getattr(search_client, "quotes", None)
+    except Exception as err:  # pragma: no cover - network dependent
+        raise RuntimeError(f"Search failed: {err}") from err
+
+    return _normalize_discovery_records(quotes)
+
+
+LOOKUP_CATEGORIES = {
+    "All": "get_all",
+    "Stock": "get_stock",
+    "Mutual Fund": "get_mutualfund",
+    "ETF": "get_etf",
+    "Index": "get_index",
+    "Future": "get_future",
+    "Currency": "get_currency",
+    "Cryptocurrency": "get_cryptocurrency",
+}
+
+
+@st.cache_data(show_spinner=False)
+def lookup_ticker_universe(
+    query: str,
+    *,
+    category: str = "All",
+    count: int = 25,
+) -> pd.DataFrame:
+    """Discover tickers via Yahoo Finance Lookup."""
+
+    if not query.strip():
+        return _empty_metadata_frame()
+
+    method_name = LOOKUP_CATEGORIES.get(category, "get_all")
+
+    try:
+        client = yf.Lookup(query.strip())
+        method = getattr(client, method_name, None)
+        if callable(method):
+            records = method(count=count)
+        else:
+            fallback = getattr(client, category.lower(), None)
+            records = fallback if fallback is not None else client.all
+    except Exception as err:  # pragma: no cover - network dependent
+        raise RuntimeError(f"Lookup failed: {err}") from err
+
+    return _normalize_discovery_records(records)
+
+
+def _call_with_optional_repair(
+    func: Callable[..., pd.DataFrame],
+    *,
+    args: Optional[Iterable[object]] = None,
+    kwargs: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
+    """Invoke a callable that may or may not accept a ``repair`` keyword.
+
+    yfinance introduced a ``repair`` flag to automatically patch missing data. Older
+    versions of the library reject the argument, so we optimistically attempt the call
+    with ``repair=True`` and gracefully retry without the flag if it is unsupported.
+    """
+
+    call_args = tuple(args or ())
+    base_kwargs = dict(kwargs or {})
+
+    if "repair" not in base_kwargs:
+        repair_kwargs = dict(base_kwargs)
+        repair_kwargs["repair"] = True
+        try:
+            return func(*call_args, **repair_kwargs)
+        except TypeError as exc:
+            message = str(exc).lower()
+            if "repair" not in message:
+                raise
+        # Fall through to retry without the repair flag.
+
+    return func(*call_args, **base_kwargs)
+
+
 def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
     """Download price history with retry and fallback handling."""
 
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
-            data = yf.download(
-                ticker,
-                start=start,
-                progress=False,
-                auto_adjust=False,
-                rounding=True,
-                threads=False,
+            data = _call_with_optional_repair(
+                yf.download,
+                args=(ticker,),
+                kwargs={
+                    "start": start,
+                    "progress": False,
+                    "auto_adjust": False,
+                    "rounding": True,
+                    "threads": False,
+                },
             )
         except Exception as err:  # pragma: no cover - network dependent
             last_error = err
@@ -354,6 +525,8 @@ def golden_cross_strategy(
 
     if price_data.empty:
         raise ValueError("Price data cannot be empty")
+    if profit_target <= 0:
+        raise ValueError("Profit target must be positive")
 
     price = price_data.get("Adj Close")
     if price is None or price.isna().all():
@@ -383,18 +556,23 @@ def golden_cross_strategy(
     last_signal: Optional[str] = None
     last_signal_date: Optional[pd.Timestamp] = None
 
-    equity = pd.Series(index=df.index, dtype=float)
-    equity.iloc[0] = 1.0
-    equity = equity.ffill()
+    equity = pd.Series(1.0, index=df.index, dtype=float)
     current_equity = 1.0
+    entry_equity: Optional[float] = None
 
     for current_date, row in df.iterrows():
         price_value = row["price"]
+        if entry_price is not None and entry_equity is not None:
+            equity_value = entry_equity * (price_value / entry_price)
+        else:
+            equity_value = current_equity
+
         target_price = entry_price * (1 + profit_target) if entry_price is not None else None
         if entry_price is None:
             if crosses_up.loc[current_date]:
                 entry_price = price_value
                 entry_date = current_date
+                entry_equity = current_equity
                 last_signal = "Buy"
                 last_signal_date = current_date
         else:
@@ -403,16 +581,19 @@ def golden_cross_strategy(
                 exit_reason = "target"
             elif row["sma50"] < row["sma200"]:
                 exit_reason = "death_cross"
-            if exit_reason is not None and entry_date is not None:
+            if exit_reason is not None and entry_date is not None and entry_equity is not None:
                 trades.append(Trade(ticker, entry_date, current_date, entry_price, price_value))
-                current_equity *= price_value / entry_price
-                equity.loc[current_date] = current_equity
+                current_equity = entry_equity * (price_value / entry_price)
+                equity_value = current_equity
                 entry_price = None
                 entry_date = None
+                entry_equity = None
                 last_signal = "Sell"
                 last_signal_date = current_date
 
-    equity = equity.sort_index().ffill().fillna(method="bfill")
+        equity.loc[current_date] = equity_value
+
+    equity = equity.sort_index().ffill().bfill()
     if equity.empty:
         equity = pd.Series([1.0], index=[df.index[0]])
 
@@ -476,21 +657,48 @@ def compute_statistics(index: pd.Index, trades: Iterable[Trade], equity_curve: p
 
 def scan_tickers(
     tickers: Iterable[str],
-    start_date: date,
+    start_date: date | datetime | pd.Timestamp,
     profit_target: float,
     win_rate_threshold: float,
     cagr_threshold: float,
     *,
-    price_fetcher: Optional[Callable[[str, date], pd.DataFrame]] = None,
+    price_fetcher: Optional[
+        Callable[[str, date | datetime | pd.Timestamp], pd.DataFrame]
+    ] = None,
+    metadata: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run the strategy for each ticker and build summary tables."""
 
-    metadata = get_metadata()
+    if profit_target <= 0:
+        raise ValueError("profit_target must be positive")
+
+    normalized_start: date
+    if isinstance(start_date, datetime):
+        normalized_start = start_date.date()
+    elif isinstance(start_date, pd.Timestamp):
+        normalized_start = start_date.date()
+    elif isinstance(start_date, date):
+        normalized_start = start_date
+    else:
+        raise TypeError("start_date must be a date instance")
+
+    if normalized_start > date.today():
+        raise ValueError("start_date cannot be in the future")
+
+    start_date = normalized_start
+
+    filtered_tickers = [
+        ticker for ticker in tickers if isinstance(ticker, str) and ticker.strip()
+    ]
+    if not filtered_tickers:
+        return pd.DataFrame(), pd.DataFrame()
+
+    metadata_df = _prepare_metadata_frame(metadata)
     fetcher = price_fetcher or fetch_price_history
     signals_rows: List[Dict[str, object]] = []
     history_rows: List[Dict[str, object]] = []
 
-    for ticker in tickers:
+    for ticker in filtered_tickers:
         try:
             price_data = fetcher(ticker, start=start_date)
         except Exception as err:
@@ -529,7 +737,7 @@ def scan_tickers(
             )
             continue
 
-        row_meta = metadata.loc[ticker] if ticker in metadata.index else None
+        row_meta = metadata_df.loc[ticker] if ticker in metadata_df.index else None
         win_rate = result.stats.get("win_rate", 0.0)
         cagr = result.stats.get("cagr", 0.0)
         meets_thresholds = win_rate >= win_rate_threshold and cagr > cagr_threshold
@@ -597,24 +805,91 @@ def build_streamlit_app() -> None:
     st.set_page_config(page_title="ASX200 Daily Signals", layout="wide")
     st.title("ASX200 Daily Golden Cross Signals")
 
-    metadata = get_metadata()
+    metadata = _empty_metadata_frame()
+    filtered_metadata = metadata
+    search_query = ""
+    search_results_limit = 25
+    lookup_query = ""
+    lookup_category = "All"
+    lookup_count = 25
+    cap_range: Optional[Tuple[float, float]] = None
+    ticker_source = "ASX200 Universe"
+    custom_ticker = ""
 
     with st.sidebar:
         st.header("Universe & Filters")
-        sectors = sorted(metadata["sector"].dropna().unique().tolist())
-        selected_sectors = st.multiselect("Sectors", options=sectors, default=sectors)
-
-        min_cap = float(metadata["market_cap_billion"].min())
-        max_cap = float(metadata["market_cap_billion"].max())
-        cap_range = st.slider(
-            "Market Cap Range (AUD billions)",
-            min_value=float(np.floor(min_cap)),
-            max_value=float(np.ceil(max_cap)),
-            value=(float(np.floor(min_cap)), float(np.ceil(max_cap))),
-            step=0.5,
+        ticker_source = st.selectbox(
+            "Ticker source",
+            options=("ASX200 Universe", "Yahoo Finance Search", "Yahoo Finance Lookup"),
+            index=0,
         )
 
-        custom_ticker = st.text_input("Custom ticker override (optional)", value="")
+        if ticker_source == "ASX200 Universe":
+            metadata = get_metadata().copy()
+            sectors = sorted(metadata["sector"].dropna().unique().tolist())
+            selected_sectors = st.multiselect(
+                "Sectors", options=sectors, default=sectors
+            )
+
+            min_cap = float(metadata["market_cap_billion"].min())
+            max_cap = float(metadata["market_cap_billion"].max())
+            cap_range = st.slider(
+                "Market Cap Range (AUD billions)",
+                min_value=float(np.floor(min_cap)),
+                max_value=float(np.ceil(max_cap)),
+                value=(float(np.floor(min_cap)), float(np.ceil(max_cap))),
+                step=0.5,
+            )
+
+            custom_ticker = st.text_input(
+                "Custom ticker override (optional)", value=""
+            )
+
+            filtered_metadata = metadata[
+                metadata["sector"].isin(selected_sectors)
+                & (metadata["market_cap_billion"] >= cap_range[0])
+                & (metadata["market_cap_billion"] <= cap_range[1])
+            ]
+        elif ticker_source == "Yahoo Finance Search":
+            search_query = st.text_input("Search query", value="").strip()
+            search_results_limit = st.slider(
+                "Max search results", min_value=5, max_value=50, value=25, step=5
+            )
+            if search_query:
+                try:
+                    metadata = search_ticker_universe(
+                        search_query, max_results=search_results_limit
+                    )
+                except RuntimeError as err:
+                    st.error(str(err))
+                    metadata = _empty_metadata_frame()
+            else:
+                st.info("Enter a search term to discover tickers via Yahoo Finance.")
+                metadata = _empty_metadata_frame()
+
+            filtered_metadata = metadata
+        else:
+            lookup_query = st.text_input("Lookup query", value="").strip()
+            lookup_category = st.selectbox(
+                "Lookup category", options=tuple(LOOKUP_CATEGORIES.keys())
+            )
+            lookup_count = st.slider(
+                "Lookup result count", min_value=5, max_value=100, value=25, step=5
+            )
+            if lookup_query:
+                try:
+                    metadata = lookup_ticker_universe(
+                        lookup_query, category=lookup_category, count=lookup_count
+                    )
+                except RuntimeError as err:
+                    st.error(str(err))
+                    metadata = _empty_metadata_frame()
+            else:
+                st.info("Enter a lookup term to discover tickers via Yahoo Finance.")
+                metadata = _empty_metadata_frame()
+
+            filtered_metadata = metadata
+
         st.header("Strategy Settings")
         profit_target = st.slider("Profit target", min_value=0.01, max_value=0.25, value=0.05, step=0.01)
         history_years = st.slider("History (years)", min_value=5, max_value=10, value=7)
@@ -623,42 +898,123 @@ def build_streamlit_app() -> None:
 
         run_button = st.button("Run Scan")
 
-    filtered_metadata = metadata[
-        metadata["sector"].isin(selected_sectors)
-        & (metadata["market_cap_billion"] >= cap_range[0])
-        & (metadata["market_cap_billion"] <= cap_range[1])
-    ]
+    if ticker_source == "ASX200 Universe":
+        if custom_ticker:
+            custom_ticker = custom_ticker.strip().upper()
+            if custom_ticker and custom_ticker not in filtered_metadata.index:
+                filtered_metadata = pd.concat(
+                    [
+                        filtered_metadata,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "ticker": custom_ticker,
+                                    "sector": "Custom",
+                                    "market_cap_billion": np.nan,
+                                }
+                            ],
+                            index=[custom_ticker],
+                        ),
+                    ]
+                )
 
-    if custom_ticker:
-        custom_ticker = custom_ticker.strip().upper()
-        if custom_ticker and custom_ticker not in filtered_metadata.index:
-            filtered_metadata = pd.concat([
-                filtered_metadata,
-                pd.DataFrame(
-                    [{"ticker": custom_ticker, "sector": "Custom", "market_cap_billion": np.nan}],
-                    index=[custom_ticker],
-                ),
-            ])
+        if cap_range is not None:
+            st.write(
+                "Scanning **{count}** tickers between {low:.1f} and {high:.1f} "
+                "billion AUD.".format(
+                    count=len(filtered_metadata), low=cap_range[0], high=cap_range[1]
+                )
+            )
+    elif ticker_source == "Yahoo Finance Search":
+        if search_query:
+            st.write(
+                f"Scanning **{len(filtered_metadata)}** tickers from Yahoo Finance Search "
+                f"results for \"{search_query}\"."
+            )
+    else:
+        if lookup_query:
+            st.write(
+                f"Scanning **{len(filtered_metadata)}** tickers from Yahoo Finance Lookup "
+                f"results for \"{lookup_query}\" ({lookup_category})."
+            )
 
-    st.write(
-        f"Scanning **{len(filtered_metadata)}** tickers between {cap_range[0]:.1f} and {cap_range[1]:.1f} billion AUD."
-    )
+    if ticker_source != "ASX200 Universe" and not filtered_metadata.empty:
+        display_columns = [
+            col for col in ["ticker", "name", "exchange", "type"] if col in filtered_metadata.columns
+        ]
+        st.dataframe(filtered_metadata.reset_index(drop=True)[display_columns])
 
     start_date = date.today() - timedelta(days=history_years * 365)
 
-    if run_button or st.session_state.get("auto_run", True):
-        st.session_state["auto_run"] = False
-        with st.spinner("Running strategy across tickers..."):
-            signals_df, history_df = scan_tickers(
-                filtered_metadata["ticker"].tolist(),
-                start_date=start_date,
-                profit_target=profit_target,
-                win_rate_threshold=win_rate_threshold,
-                cagr_threshold=cagr_threshold,
+    tickers_to_scan = [
+        ticker
+        for ticker in filtered_metadata["ticker"].tolist()
+        if isinstance(ticker, str) and ticker.strip()
+    ]
+
+    if not tickers_to_scan:
+        if ticker_source == "ASX200 Universe":
+            st.warning(
+                "No valid tickers remain after applying the current filters. "
+                "Adjust your selections or provide a custom ticker."
             )
+        elif ticker_source == "Yahoo Finance Search" and search_query:
+            st.warning(
+                "No tickers were returned by Yahoo Finance Search. "
+                "Refine your query and try again."
+            )
+        elif ticker_source == "Yahoo Finance Lookup" and lookup_query:
+            st.warning(
+                "No tickers were returned by Yahoo Finance Lookup. "
+                "Refine your query, adjust the category, or increase the result count."
+            )
+        else:
+            st.info("Provide a query to discover tickers before running the scan.")
+
+    scan_params = {
+        "tickers": tuple(tickers_to_scan),
+        "start": start_date.isoformat(),
+        "profit_target": float(profit_target),
+        "win_rate_threshold": float(win_rate_threshold),
+        "cagr_threshold": float(cagr_threshold),
+        "ticker_source": ticker_source,
+        "search_query": search_query,
+        "search_results_limit": int(search_results_limit),
+        "lookup_query": lookup_query,
+        "lookup_category": lookup_category,
+        "lookup_count": int(lookup_count),
+    }
+    previous_params = st.session_state.get("last_scan_params")
+    should_run = run_button or previous_params != scan_params
+
+    if should_run:
+        with st.spinner("Running strategy across tickers..."):
+            try:
+                signals_df, history_df = scan_tickers(
+                    tickers_to_scan,
+                    start_date=start_date,
+                    profit_target=profit_target,
+                    win_rate_threshold=win_rate_threshold,
+                    cagr_threshold=cagr_threshold,
+                    metadata=filtered_metadata,
+                )
+            except Exception as exc:
+                st.error(f"Unable to complete scan: {exc}")
+                signals_df = pd.DataFrame()
+                history_df = pd.DataFrame()
+            else:
+                st.session_state["last_scan_params"] = scan_params
+                st.session_state["scan_results"] = {
+                    "signals": signals_df.copy(),
+                    "history": history_df.copy(),
+                }
     else:
-        signals_df = pd.DataFrame()
-        history_df = pd.DataFrame()
+        cached_results = st.session_state.get("scan_results") or {}
+        signals_df = cached_results.get("signals", pd.DataFrame()).copy()
+        history_df = cached_results.get("history", pd.DataFrame()).copy()
+        if signals_df.empty and history_df.empty:
+            # No cached results yet and button not pressed; trigger initial scan on next run.
+            st.session_state.pop("last_scan_params", None)
 
     if not history_df.empty and "status" in history_df.columns:
         error_rows = history_df[history_df["status"].str.contains("Data error", na=False)]
@@ -777,8 +1133,18 @@ def show_ticker_details(result: StrategyResult) -> None:
 # -------------------
 
 
-def _generate_synthetic_price(start_price: float, days: int, drift: float = 0.0005) -> pd.DataFrame:
-    rng = pd.date_range(end=date.today(), periods=days, freq="B")
+TEST_ANCHOR_DATE = date(2024, 1, 2)
+
+
+def _generate_synthetic_price(
+    start_price: float,
+    days: int,
+    drift: float = 0.0005,
+    *,
+    end_date: Optional[date] = None,
+) -> pd.DataFrame:
+    anchor = end_date or TEST_ANCHOR_DATE
+    rng = pd.date_range(end=anchor, periods=days, freq="B")
     price = start_price * (1 + drift) ** np.arange(len(rng))
     df = pd.DataFrame({"Adj Close": price}, index=rng)
     df["Close"] = df["Adj Close"]
@@ -787,7 +1153,7 @@ def _generate_synthetic_price(start_price: float, days: int, drift: float = 0.00
 
 class StrategyTests(unittest.TestCase):
     def test_golden_cross_profit_target_exit(self):
-        df = _generate_synthetic_price(100.0, 400, drift=0.002)
+        df = _generate_synthetic_price(100.0, 400, drift=0.002, end_date=TEST_ANCHOR_DATE)
         result = golden_cross_strategy("TEST", df, profit_target=0.05)
         self.assertGreater(result.stats["win_rate"], 0)
         self.assertEqual(result.last_signal, "Hold")
@@ -795,14 +1161,14 @@ class StrategyTests(unittest.TestCase):
     def test_batch_scan_returns_signals(self):
         metadata = get_metadata()
         tickers = metadata.head(3)["ticker"].tolist()
-        synthetic_data = _generate_synthetic_price(50.0, 400, drift=0.002)
+        synthetic_data = _generate_synthetic_price(50.0, 400, drift=0.002, end_date=TEST_ANCHOR_DATE)
 
         def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
             return synthetic_data
 
         signals, history = scan_tickers(
             tickers,
-            start_date=date.today() - timedelta(days=365 * 5),
+            start_date=TEST_ANCHOR_DATE - timedelta(days=365 * 5),
             profit_target=0.05,
             win_rate_threshold=0.1,
             cagr_threshold=-0.1,
@@ -812,7 +1178,7 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(history.empty)
 
     def test_threshold_filters(self):
-        df = _generate_synthetic_price(100, 400, drift=-0.001)
+        df = _generate_synthetic_price(100, 400, drift=-0.001, end_date=TEST_ANCHOR_DATE)
         result = golden_cross_strategy("BEAR", df, profit_target=0.05)
         history = pd.DataFrame(
             [{"ticker": "BEAR", "win_rate": result.stats["win_rate"], "cagr": result.stats["cagr"]}]
@@ -826,11 +1192,11 @@ class StrategyTests(unittest.TestCase):
         def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
             if ticker == "BAD.AX":
                 raise ValueError("Missing data")
-            return _generate_synthetic_price(50.0, 200, drift=0.001)
+            return _generate_synthetic_price(50.0, 200, drift=0.001, end_date=TEST_ANCHOR_DATE)
 
         signals, history = scan_tickers(
             tickers,
-            start_date=date.today() - timedelta(days=365),
+            start_date=TEST_ANCHOR_DATE - timedelta(days=365),
             profit_target=0.05,
             win_rate_threshold=0.0,
             cagr_threshold=-1.0,
@@ -853,7 +1219,7 @@ class StrategyTests(unittest.TestCase):
                 raise TypeError("unexpected keyword argument 'repair'")
             return pd.DataFrame({"value": [1.0]})
 
-        result = _call_with_optional_repair(fake_download, kwargs={"start": date.today()})
+        result = _call_with_optional_repair(fake_download, kwargs={"start": TEST_ANCHOR_DATE})
         self.assertIsInstance(result, pd.DataFrame)
         self.assertFalse(result.empty)
         self.assertGreaterEqual(len(calls), 2)
