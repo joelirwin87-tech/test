@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -254,18 +255,56 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
+def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
+    """Download price history with retry and fallback handling."""
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            data = yf.download(
+                ticker,
+                start=start,
+                progress=False,
+                auto_adjust=False,
+                rounding=True,
+                threads=False,
+            )
+        except Exception as err:  # pragma: no cover - network dependent
+            last_error = err
+            data = pd.DataFrame()
+
+        if not data.empty:
+            return data
+
+        time.sleep(min(2.0 * attempt, 6.0))
+
+    ticker_client = yf.Ticker(ticker)
+    try:
+        data = ticker_client.history(start=start, interval="1d", auto_adjust=False, actions=False)
+    except Exception as err:  # pragma: no cover - network dependent
+        last_error = err
+        data = pd.DataFrame()
+
+    if data.empty:
+        try:
+            fallback = ticker_client.history(period="max", interval="1d", auto_adjust=False, actions=False)
+        except Exception as err:  # pragma: no cover - network dependent
+            last_error = err
+            fallback = pd.DataFrame()
+        if not fallback.empty:
+            data = fallback[fallback.index >= pd.Timestamp(start)]
+
+    if data.empty:
+        detail = f": {last_error}" if last_error else ""
+        raise ValueError(f"No data returned for {ticker}{detail}")
+
+    return data
+
+
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
     """Fetch daily OHLCV data for a ticker using yfinance."""
 
-    data = yf.download(
-        ticker,
-        start=start,
-        progress=False,
-        auto_adjust=False,
-        rounding=True,
-    )
-    if data.empty:
-        raise ValueError(f"No data returned for {ticker}")
+    data = _download_with_backoff(ticker, start)
     data = data.reset_index().rename(columns={"Date": "date"})
     data["date"] = pd.to_datetime(data["date"]).dt.tz_localize(None)
     data = data.set_index("date").sort_index()
