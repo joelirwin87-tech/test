@@ -177,66 +177,54 @@ def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParame
 
 
 def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
-    """Ensure essential OHLC columns exist by backfilling from available data."""
+    """Ensure essential OHLCV columns exist and contain numeric data."""
 
     if data is None or data.empty:
-        raise ValueError("Price data is empty.")
+        raise ValueError("Ticker returned no price data.")
 
     df = data.copy()
-    if "Adj Close" not in df.columns:
-        if "Close" in df.columns:
-            df["Adj Close"] = df["Close"].copy()
-        else:
-            raise ValueError("Price data must contain either 'Adj Close' or 'Close'.")
-    if "Close" not in df.columns:
-        df["Close"] = df["Adj Close"].copy()
+    df.columns = [str(column) for column in df.columns]
+
+    close_col = "Close"
+    adj_close_col = "Adj Close"
+    if adj_close_col not in df.columns:
+        if close_col not in df.columns:
+            raise ValueError("Ticker returned no price data.")
+        df[adj_close_col] = df[close_col]
+    if close_col not in df.columns:
+        df[close_col] = df[adj_close_col]
+
     if "High" not in df.columns:
-        df["High"] = df[["Adj Close", "Close"]].max(axis=1)
+        df["High"] = df[[adj_close_col, close_col]].max(axis=1)
     if "Low" not in df.columns:
-        df["Low"] = df[["Adj Close", "Close"]].min(axis=1)
+        df["Low"] = df[[adj_close_col, close_col]].min(axis=1)
     if "Open" not in df.columns:
-        df["Open"] = df["Close"]
+        df["Open"] = df[close_col]
     if "Volume" not in df.columns:
-        df["Volume"] = 0
+        df["Volume"] = 0.0
+
+    numeric_columns = ["Open", "High", "Low", close_col, adj_close_col, "Volume"]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.ffill().bfill()
+    price_columns = ["Open", "High", "Low", close_col, adj_close_col]
+    df[price_columns] = df[price_columns].ffill().bfill()
+    df["Volume"] = df["Volume"].fillna(0.0)
+
+    if df[price_columns].isna().any().any():
+        raise ValueError("Ticker returned no price data.")
+
     return df
 
 
 def _force_series(values, index) -> pd.Series:
-    """Coerce values into a 1D float Series aligned to the provided index."""
-
-    if not isinstance(index, pd.Index):
-        index = pd.Index(index)
+    """Coerce any input into a 1D float Series."""
 
     if isinstance(values, pd.Series):
-        return values.reindex(index).astype(float)
+        return values.astype(float)
 
-    if isinstance(values, pd.DataFrame):
-        if values.shape[1] != 1:
-            raise ValueError("Cannot coerce multi-column DataFrame into a Series.")
-        values = values.iloc[:, 0]
-        return values.reindex(index).astype(float)
-
-    arr = np.asarray(values)
-    if arr.ndim > 1:
-        arr = np.squeeze(arr)
-    arr = np.ravel(arr)
-
-    if arr.size == 0:
-        arr = np.full(len(index), np.nan, dtype=float)
-    elif arr.size == 1 and len(index) > 1:
-        arr = np.full(len(index), float(arr[0]), dtype=float)
-    elif arr.size != len(index):
-        padded = np.full(len(index), np.nan, dtype=float)
-        copy_len = min(arr.size, len(index))
-        if copy_len:
-            padded[:copy_len] = arr[:copy_len]
-        arr = padded
-    else:
-        arr = arr.astype(float, copy=False)
-
+    arr = np.asarray(values).ravel()
     return pd.Series(arr, index=index, dtype=float)
 
 
@@ -305,16 +293,30 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
         end=end + timedelta(days=1),
         progress=False,
         auto_adjust=False,
+        group_by="column",
     )
     if raw.empty:
-        raise ValueError("No price data returned. Confirm the ticker and date range.")
+        raise ValueError("Ticker returned no price data.")
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [str(col[0]) for col in raw.columns]
+
+    raw.columns = [str(column) for column in raw.columns]
+
+    if "Adj Close" not in raw.columns and "Close" in raw.columns:
+        raw["Adj Close"] = raw["Close"]
 
     raw = raw.dropna(how="all")
     if raw.empty:
-        raise ValueError("Price data only contains missing values after cleaning.")
+        raise ValueError("Ticker returned no price data.")
 
     raw.sort_index(inplace=True)
-    return _ensure_price_columns(raw)
+    raw.index = pd.to_datetime(raw.index)
+
+    try:
+        return _ensure_price_columns(raw)
+    except KeyError as exc:  # pragma: no cover - defensive
+        raise ValueError("Ticker returned no price data.") from exc
 
 
 StrategyHandler = Callable[[pd.DataFrame, StrategyParameters], Tuple[pd.Series, Dict[str, pd.Series]]]
@@ -438,11 +440,16 @@ def apply_strategy(
 
     df = _ensure_price_columns(data)
     df = df.sort_index().copy()
-    df["Adj Close"] = df["Adj Close"].astype(float)
+    df["Adj Close"] = pd.to_numeric(df["Adj Close"], errors="coerce")
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df["High"] = pd.to_numeric(df["High"], errors="coerce")
+    df["Low"] = pd.to_numeric(df["Low"], errors="coerce")
+    df["Open"] = pd.to_numeric(df["Open"], errors="coerce")
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
     params = _sanitize_parameters(params)
 
-    df["Return"] = _clean_numeric_series(df["Adj Close"].pct_change(), fill_value=0.0)
+    df["Return"] = _force_series(_clean_numeric_series(df["Adj Close"].pct_change(), fill_value=0.0), df.index)
 
     handler = STRATEGY_REGISTRY.get(strategy.strip())
     if handler is None:
@@ -454,12 +461,22 @@ def apply_strategy(
     signals = signals.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
 
     positions = _force_series(signals.shift(1).fillna(0.0), df.index)
-    strategy_returns = _clean_numeric_series(positions * df["Return"], fill_value=0.0)
+    strategy_returns = _force_series(
+        _clean_numeric_series(positions * df["Return"], fill_value=0.0),
+        df.index,
+    )
 
     equity_curve = _compute_equity_curve(strategy_returns)
     buy_hold_curve = _compute_equity_curve(df["Return"])
 
     results = df.copy()
+    results["Adj Close"] = _force_series(results["Adj Close"], df.index)
+    results["Close"] = _force_series(results["Close"], df.index)
+    results["High"] = _force_series(results["High"], df.index)
+    results["Low"] = _force_series(results["Low"], df.index)
+    results["Open"] = _force_series(results["Open"], df.index)
+    results["Volume"] = _force_series(results["Volume"], df.index)
+    results["Return"] = _force_series(results["Return"], df.index)
     for name, values in extra_columns.items():
         results[name] = _force_series(values, df.index)
     results["Signal"] = _force_series(signals, df.index)
@@ -718,28 +735,42 @@ def build_price_chart(
 
     params = _sanitize_parameters(params)
 
-    price_df = results.reset_index().rename(columns={"index": "Date"})
+    if "Adj Close" not in results.columns:
+        raise ValueError("Results missing 'Adj Close' column required for charting.")
+
+    safe_results = results.copy()
+    safe_results.index = pd.to_datetime(safe_results.index)
+
+    drop_columns: List[str] = []
+    for column_name in list(safe_results.columns):
+        column = safe_results[column_name]
+        try:
+            coerced = _force_series(column, safe_results.index).replace([np.inf, -np.inf], np.nan)
+        except Exception:
+            if column_name == "Adj Close":
+                raise ValueError("Results missing numeric 'Adj Close' data for charting.")
+            drop_columns.append(column_name)
+            continue
+        if coerced.isna().all():
+            if column_name == "Adj Close":
+                raise ValueError("Results missing numeric 'Adj Close' data for charting.")
+            drop_columns.append(column_name)
+            continue
+        safe_results[column_name] = coerced
+
+    if drop_columns:
+        safe_results = safe_results.drop(columns=drop_columns)
+
+    if "Adj Close" not in safe_results.columns:
+        raise ValueError("Results missing 'Adj Close' column required for charting.")
+
+    price_df = safe_results.reset_index().rename(columns={"index": "Date"})
     if "Date" not in price_df.columns:
         price_df.rename(columns={price_df.columns[0]: "Date"}, inplace=True)
     price_df["Date"] = pd.to_datetime(price_df["Date"])
     price_df = price_df.replace([np.inf, -np.inf], np.nan)
     price_df = price_df.dropna(subset=["Adj Close"]).copy()
     price_df = price_df.dropna(axis=1, how="all")
-    drop_columns: List[str] = []
-    for column_name in list(price_df.columns):
-        if column_name == "Date":
-            continue
-        column = price_df[column_name]
-        if getattr(column, "ndim", 1) != 1:
-            drop_columns.append(column_name)
-            continue
-        numeric_column = pd.to_numeric(column, errors="coerce")
-        if numeric_column.isna().all():
-            drop_columns.append(column_name)
-            continue
-        price_df[column_name] = numeric_column
-    if drop_columns:
-        price_df = price_df.drop(columns=drop_columns)
     if "Position" in price_df.columns:
         price_df["Position"] = price_df["Position"].fillna(0.0)
 
@@ -863,9 +894,13 @@ def _prepare_benchmark_curve(
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
 
-    benchmark_returns = _clean_numeric_series(benchmark_data["Adj Close"].pct_change(), fill_value=0.0)
-    benchmark_curve = _compute_equity_curve(benchmark_returns)
+    benchmark_returns = _force_series(
+        _clean_numeric_series(benchmark_data["Adj Close"].pct_change(), fill_value=0.0),
+        benchmark_data.index,
+    )
+    benchmark_curve = _force_series(_compute_equity_curve(benchmark_returns), benchmark_returns.index)
     benchmark_curve = benchmark_curve.reindex(pd.Index(align_index)).ffill().bfill()
+    benchmark_curve = _force_series(benchmark_curve, benchmark_curve.index)
     if benchmark_curve.isna().all():
         return None, "Benchmark data contained only missing values."
 
@@ -1090,11 +1125,14 @@ def _validate_strategy_output(results: pd.DataFrame, equity_curve: pd.Series, bu
         "Buy & Hold Equity",
     }
     checks["columns_present"] = required_columns.issubset(results.columns)
+    checks["adj_close_float"] = "Adj Close" in results.columns and np.issubdtype(results["Adj Close"].dtype, np.floating)
     checks["no_signal_nan"] = not results["Signal"].isna().any()
     checks["signal_bounds"] = bool(((results["Signal"] >= 0) & (results["Signal"] <= 1)).all())
     checks["position_nan"] = not results["Position"].isna().any()
     checks["equity_non_negative"] = bool((equity_curve >= 0).all())
     checks["buy_hold_non_negative"] = bool((buy_hold_curve >= 0).all())
+    checks["series_are_1d"] = all(getattr(results[column], "ndim", 1) == 1 for column in required_columns)
+    checks["curves_are_1d"] = getattr(equity_curve, "ndim", 1) == 1 and getattr(buy_hold_curve, "ndim", 1) == 1
     checks["params_attached"] = isinstance(results.attrs.get("strategy_parameters"), StrategyParameters)
     return checks
 
@@ -1133,6 +1171,21 @@ def _run_self_tests() -> None:
             with mock.patch("yfinance.download", return_value=pd.DataFrame()):
                 with self.assertRaises(ValueError):
                     download_data("BHP.AX", date(2020, 1, 1), date(2020, 2, 1))
+
+        def test_download_data_handles_multiindex_columns(self) -> None:
+            multiindex_data = self.mock_data.copy()
+            multiindex_data.columns = pd.MultiIndex.from_product([multiindex_data.columns, ["BHP.AX"]])
+            with mock.patch("yfinance.download", return_value=multiindex_data):
+                data = download_data("BHP.AX", date(2020, 1, 1), date(2020, 12, 31))
+                self.assertIn("Adj Close", data.columns)
+                self.assertTrue(np.issubdtype(data["Adj Close"].dtype, np.floating))
+
+        def test_download_data_creates_adj_close_from_close(self) -> None:
+            without_adj = self.mock_data.drop(columns=["Adj Close"]).copy()
+            with mock.patch("yfinance.download", return_value=without_adj):
+                data = download_data("BHP.AX", date(2020, 1, 1), date(2020, 12, 31))
+                self.assertIn("Adj Close", data.columns)
+                self.assertTrue(np.allclose(data["Adj Close"], data["Close"]))
 
         def test_apply_strategy_outputs(self) -> None:
             for strategy in STRATEGY_OPTIONS:
