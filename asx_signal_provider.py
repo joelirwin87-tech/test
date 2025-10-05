@@ -458,7 +458,15 @@ def scan_tickers(
             history_rows.append(
                 {
                     "ticker": ticker,
+                    "win_rate": 0.0,
+                    "average_return": 0.0,
+                    "cagr": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0.0,
+                    "total_return": 0.0,
                     "status": f"Data error: {err}",
+                    "sector": None,
+                    "market_cap_billion": None,
                 }
             )
             continue
@@ -469,7 +477,15 @@ def scan_tickers(
             history_rows.append(
                 {
                     "ticker": ticker,
+                    "win_rate": 0.0,
+                    "average_return": 0.0,
+                    "cagr": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0.0,
+                    "total_return": 0.0,
                     "status": f"Strategy error: {err}",
+                    "sector": None,
+                    "market_cap_billion": None,
                 }
             )
             continue
@@ -514,9 +530,11 @@ def scan_tickers(
 
     signals_df = pd.DataFrame(signals_rows)
     history_df = pd.DataFrame(history_rows)
-    if not signals_df.empty:
-        signals_df = signals_df.sort_values(["signal", "historical_win_rate"], ascending=[False, False])
-    if not history_df.empty:
+    if not signals_df.empty and "historical_win_rate" in signals_df.columns:
+        signals_df = signals_df.sort_values(
+            ["signal", "historical_win_rate"], ascending=[False, False]
+        )
+    if not history_df.empty and "win_rate" in history_df.columns:
         history_df = history_df.sort_values("win_rate", ascending=False)
 
     return signals_df, history_df
@@ -593,14 +611,23 @@ def build_streamlit_app() -> None:
         signals_df = pd.DataFrame()
         history_df = pd.DataFrame()
 
+    if not history_df.empty and "status" in history_df.columns:
+        error_rows = history_df[history_df["status"].str.contains("Data error", na=False)]
+        if not error_rows.empty:
+            unique_errors = sorted({ticker for ticker in error_rows["ticker"].dropna()})
+            st.warning(
+                "Failed to download data for the following tickers: "
+                + ", ".join(unique_errors)
+            )
+
     st.subheader("Today's Signals")
     if signals_df.empty:
         st.info("No actionable signals matched the historical filters today.")
     else:
         display_df = signals_df.copy()
-        if "historical_win_rate" in display_df:
+        if "historical_win_rate" in display_df.columns:
             display_df["historical_win_rate"] = display_df["historical_win_rate"].map(_format_percentage)
-        if "historical_cagr" in display_df:
+        if "historical_cagr" in display_df.columns:
             display_df["historical_cagr"] = display_df["historical_cagr"].map(_format_percentage)
         st.dataframe(display_df)
         csv = signals_df.to_csv(index=False).encode("utf-8")
@@ -743,6 +770,30 @@ class StrategyTests(unittest.TestCase):
         )
         filtered = history[(history["win_rate"] >= 0.55) & (history["cagr"] > 0)]
         self.assertTrue(filtered.empty)
+
+    def test_scan_handles_fetch_error(self):
+        tickers = ["GOOD.AX", "BAD.AX"]
+
+        def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
+            if ticker == "BAD.AX":
+                raise ValueError("Missing data")
+            return _generate_synthetic_price(50.0, 200, drift=0.001)
+
+        signals, history = scan_tickers(
+            tickers,
+            start_date=date.today() - timedelta(days=365),
+            profit_target=0.05,
+            win_rate_threshold=0.0,
+            cagr_threshold=-1.0,
+            price_fetcher=fake_fetch,
+        )
+
+        self.assertIn("BAD.AX", history["ticker"].values)
+        bad_row = history.loc[history["ticker"] == "BAD.AX"].iloc[0]
+        self.assertEqual(bad_row["win_rate"], 0.0)
+        self.assertEqual(bad_row["total_trades"], 0.0)
+        self.assertTrue(str(bad_row["status"]).startswith("Data error"))
+        self.assertFalse(signals.empty)
 
 
 class SimpleTestResult:
