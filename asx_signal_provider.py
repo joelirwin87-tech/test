@@ -255,19 +255,52 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
+def _call_with_optional_repair(
+    func: Callable[..., pd.DataFrame],
+    *,
+    args: Optional[Iterable[object]] = None,
+    kwargs: Optional[Dict[str, object]] = None,
+) -> pd.DataFrame:
+    """Invoke a callable that may or may not accept a ``repair`` keyword.
+
+    yfinance introduced a ``repair`` flag to automatically patch missing data. Older
+    versions of the library reject the argument, so we optimistically attempt the call
+    with ``repair=True`` and gracefully retry without the flag if it is unsupported.
+    """
+
+    call_args = tuple(args or ())
+    base_kwargs = dict(kwargs or {})
+
+    if "repair" not in base_kwargs:
+        repair_kwargs = dict(base_kwargs)
+        repair_kwargs["repair"] = True
+        try:
+            return func(*call_args, **repair_kwargs)
+        except TypeError as exc:
+            message = str(exc).lower()
+            if "repair" not in message:
+                raise
+        # Fall through to retry without the repair flag.
+
+    return func(*call_args, **base_kwargs)
+
+
 def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
     """Download price history with retry and fallback handling."""
 
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
-            data = yf.download(
-                ticker,
-                start=start,
-                progress=False,
-                auto_adjust=False,
-                rounding=True,
-                threads=False,
+            data = _call_with_optional_repair(
+                yf.download,
+                args=(ticker,),
+                kwargs={
+                    "start": start,
+                    "progress": False,
+                    "auto_adjust": False,
+                    "rounding": True,
+                    "threads": False,
+                },
             )
         except Exception as err:  # pragma: no cover - network dependent
             last_error = err
@@ -354,6 +387,8 @@ def golden_cross_strategy(
 
     if price_data.empty:
         raise ValueError("Price data cannot be empty")
+    if profit_target <= 0:
+        raise ValueError("Profit target must be positive")
 
     price = price_data.get("Adj Close")
     if price is None or price.isna().all():
@@ -383,18 +418,23 @@ def golden_cross_strategy(
     last_signal: Optional[str] = None
     last_signal_date: Optional[pd.Timestamp] = None
 
-    equity = pd.Series(index=df.index, dtype=float)
-    equity.iloc[0] = 1.0
-    equity = equity.ffill()
+    equity = pd.Series(np.nan, index=df.index, dtype=float)
     current_equity = 1.0
+    entry_equity: Optional[float] = None
 
     for current_date, row in df.iterrows():
         price_value = row["price"]
+        if entry_price is not None and entry_equity is not None:
+            equity_value = entry_equity * (price_value / entry_price)
+        else:
+            equity_value = current_equity
+
         target_price = entry_price * (1 + profit_target) if entry_price is not None else None
         if entry_price is None:
             if crosses_up.loc[current_date]:
                 entry_price = price_value
                 entry_date = current_date
+                entry_equity = current_equity
                 last_signal = "Buy"
                 last_signal_date = current_date
         else:
@@ -403,16 +443,19 @@ def golden_cross_strategy(
                 exit_reason = "target"
             elif row["sma50"] < row["sma200"]:
                 exit_reason = "death_cross"
-            if exit_reason is not None and entry_date is not None:
+            if exit_reason is not None and entry_date is not None and entry_equity is not None:
                 trades.append(Trade(ticker, entry_date, current_date, entry_price, price_value))
-                current_equity *= price_value / entry_price
-                equity.loc[current_date] = current_equity
+                current_equity = entry_equity * (price_value / entry_price)
+                equity_value = current_equity
                 entry_price = None
                 entry_date = None
+                entry_equity = None
                 last_signal = "Sell"
                 last_signal_date = current_date
 
-    equity = equity.sort_index().ffill().fillna(method="bfill")
+        equity.loc[current_date] = equity_value
+
+    equity = equity.sort_index().ffill().bfill()
     if equity.empty:
         equity = pd.Series([1.0], index=[df.index[0]])
 
@@ -484,6 +527,24 @@ def scan_tickers(
     price_fetcher: Optional[Callable[[str, date], pd.DataFrame]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run the strategy for each ticker and build summary tables."""
+
+    if profit_target <= 0:
+        raise ValueError("profit_target must be positive")
+
+    normalized_start: Optional[date]
+    if isinstance(start_date, datetime):
+        normalized_start = start_date.date()
+    elif isinstance(start_date, pd.Timestamp):
+        normalized_start = start_date.date()
+    elif isinstance(start_date, date):
+        normalized_start = start_date
+    else:
+        raise TypeError("start_date must be a date instance")
+
+    if normalized_start > date.today():
+        raise ValueError("start_date cannot be in the future")
+
+    start_date = normalized_start
 
     metadata = get_metadata()
     fetcher = price_fetcher or fetch_price_history
@@ -646,19 +707,49 @@ def build_streamlit_app() -> None:
 
     start_date = date.today() - timedelta(days=history_years * 365)
 
-    if run_button or st.session_state.get("auto_run", True):
-        st.session_state["auto_run"] = False
+    tickers_to_scan = [
+        ticker
+        for ticker in filtered_metadata["ticker"].tolist()
+        if isinstance(ticker, str) and ticker.strip()
+    ]
+
+    scan_params = {
+        "tickers": tuple(tickers_to_scan),
+        "start": start_date.isoformat(),
+        "profit_target": float(profit_target),
+        "win_rate_threshold": float(win_rate_threshold),
+        "cagr_threshold": float(cagr_threshold),
+    }
+    previous_params = st.session_state.get("last_scan_params")
+    should_run = run_button or previous_params != scan_params
+
+    if should_run:
         with st.spinner("Running strategy across tickers..."):
-            signals_df, history_df = scan_tickers(
-                filtered_metadata["ticker"].tolist(),
-                start_date=start_date,
-                profit_target=profit_target,
-                win_rate_threshold=win_rate_threshold,
-                cagr_threshold=cagr_threshold,
-            )
+            try:
+                signals_df, history_df = scan_tickers(
+                    tickers_to_scan,
+                    start_date=start_date,
+                    profit_target=profit_target,
+                    win_rate_threshold=win_rate_threshold,
+                    cagr_threshold=cagr_threshold,
+                )
+            except Exception as exc:
+                st.error(f"Unable to complete scan: {exc}")
+                signals_df = pd.DataFrame()
+                history_df = pd.DataFrame()
+            else:
+                st.session_state["last_scan_params"] = scan_params
+                st.session_state["scan_results"] = {
+                    "signals": signals_df.copy(),
+                    "history": history_df.copy(),
+                }
     else:
-        signals_df = pd.DataFrame()
-        history_df = pd.DataFrame()
+        cached_results = st.session_state.get("scan_results") or {}
+        signals_df = cached_results.get("signals", pd.DataFrame()).copy()
+        history_df = cached_results.get("history", pd.DataFrame()).copy()
+        if signals_df.empty and history_df.empty:
+            # No cached results yet and button not pressed; trigger initial scan on next run.
+            st.session_state.pop("last_scan_params", None)
 
     if not history_df.empty and "status" in history_df.columns:
         error_rows = history_df[history_df["status"].str.contains("Data error", na=False)]
@@ -777,8 +868,18 @@ def show_ticker_details(result: StrategyResult) -> None:
 # -------------------
 
 
-def _generate_synthetic_price(start_price: float, days: int, drift: float = 0.0005) -> pd.DataFrame:
-    rng = pd.date_range(end=date.today(), periods=days, freq="B")
+TEST_ANCHOR_DATE = date(2024, 1, 2)
+
+
+def _generate_synthetic_price(
+    start_price: float,
+    days: int,
+    drift: float = 0.0005,
+    *,
+    end_date: Optional[date] = None,
+) -> pd.DataFrame:
+    anchor = end_date or TEST_ANCHOR_DATE
+    rng = pd.date_range(end=anchor, periods=days, freq="B")
     price = start_price * (1 + drift) ** np.arange(len(rng))
     df = pd.DataFrame({"Adj Close": price}, index=rng)
     df["Close"] = df["Adj Close"]
@@ -787,7 +888,7 @@ def _generate_synthetic_price(start_price: float, days: int, drift: float = 0.00
 
 class StrategyTests(unittest.TestCase):
     def test_golden_cross_profit_target_exit(self):
-        df = _generate_synthetic_price(100.0, 400, drift=0.002)
+        df = _generate_synthetic_price(100.0, 400, drift=0.002, end_date=TEST_ANCHOR_DATE)
         result = golden_cross_strategy("TEST", df, profit_target=0.05)
         self.assertGreater(result.stats["win_rate"], 0)
         self.assertEqual(result.last_signal, "Hold")
@@ -795,14 +896,14 @@ class StrategyTests(unittest.TestCase):
     def test_batch_scan_returns_signals(self):
         metadata = get_metadata()
         tickers = metadata.head(3)["ticker"].tolist()
-        synthetic_data = _generate_synthetic_price(50.0, 400, drift=0.002)
+        synthetic_data = _generate_synthetic_price(50.0, 400, drift=0.002, end_date=TEST_ANCHOR_DATE)
 
         def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
             return synthetic_data
 
         signals, history = scan_tickers(
             tickers,
-            start_date=date.today() - timedelta(days=365 * 5),
+            start_date=TEST_ANCHOR_DATE - timedelta(days=365 * 5),
             profit_target=0.05,
             win_rate_threshold=0.1,
             cagr_threshold=-0.1,
@@ -812,7 +913,7 @@ class StrategyTests(unittest.TestCase):
         self.assertFalse(history.empty)
 
     def test_threshold_filters(self):
-        df = _generate_synthetic_price(100, 400, drift=-0.001)
+        df = _generate_synthetic_price(100, 400, drift=-0.001, end_date=TEST_ANCHOR_DATE)
         result = golden_cross_strategy("BEAR", df, profit_target=0.05)
         history = pd.DataFrame(
             [{"ticker": "BEAR", "win_rate": result.stats["win_rate"], "cagr": result.stats["cagr"]}]
@@ -826,11 +927,11 @@ class StrategyTests(unittest.TestCase):
         def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
             if ticker == "BAD.AX":
                 raise ValueError("Missing data")
-            return _generate_synthetic_price(50.0, 200, drift=0.001)
+            return _generate_synthetic_price(50.0, 200, drift=0.001, end_date=TEST_ANCHOR_DATE)
 
         signals, history = scan_tickers(
             tickers,
-            start_date=date.today() - timedelta(days=365),
+            start_date=TEST_ANCHOR_DATE - timedelta(days=365),
             profit_target=0.05,
             win_rate_threshold=0.0,
             cagr_threshold=-1.0,
@@ -853,7 +954,7 @@ class StrategyTests(unittest.TestCase):
                 raise TypeError("unexpected keyword argument 'repair'")
             return pd.DataFrame({"value": [1.0]})
 
-        result = _call_with_optional_repair(fake_download, kwargs={"start": date.today()})
+        result = _call_with_optional_repair(fake_download, kwargs={"start": TEST_ANCHOR_DATE})
         self.assertIsInstance(result, pd.DataFrame)
         self.assertFalse(result.empty)
         self.assertGreaterEqual(len(calls), 2)
