@@ -1,23 +1,24 @@
-"""ASX Backtester Streamlit application with internal self-tests."""
+"""Production-grade ASX backtesting Streamlit application with self-tests."""
+from __future__ import annotations
+
 import io
 import math
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-try:  # pragma: no cover - fallback ensures self-tests run without Altair installed
+try:  # pragma: no cover - allow running tests without Altair installed
     import altair as alt
 except ModuleNotFoundError:  # pragma: no cover
     from types import SimpleNamespace
 
     class _FallbackChart:
+        """Minimal Altair-compatible chart used when Altair is unavailable."""
+
         def __init__(self, data=None):
             self._spec: Dict[str, object] = {"encoding": {}}
-            if data is not None:
-                self._spec["data"] = {"values": self._to_records(data)}
-            else:
-                self._spec["data"] = None
+            self._spec["data"] = {"values": self._to_records(data)} if data is not None else None
 
         @staticmethod
         def _to_records(data):
@@ -40,6 +41,10 @@ except ModuleNotFoundError:  # pragma: no cover
             self._spec["mark"] = {"type": "point", **kwargs}
             return self
 
+        def mark_bar(self, **kwargs):
+            self._spec["mark"] = {"type": "bar", **kwargs}
+            return self
+
         def encode(self, **kwargs):
             self._spec.setdefault("encoding", {}).update(kwargs)
             return self
@@ -52,6 +57,10 @@ except ModuleNotFoundError:  # pragma: no cover
             resolve = self._spec.setdefault("resolve", {})
             scale = resolve.setdefault("scale", {})
             scale.update(kwargs)
+            return self
+
+        def transform_fold(self, fields, as_):
+            self._spec.setdefault("transform", []).append({"fold": fields, "as": list(as_)})
             return self
 
         def to_dict(self):
@@ -98,6 +107,8 @@ COMMON_TICKERS: List[str] = [
     "TLS.AX",
 ]
 
+DEFAULT_BENCHMARKS: List[str] = ["XJO.AX", "XAO.AX", "STW.AX"]
+
 STRATEGY_OPTIONS: List[str] = [
     "Buy and Hold",
     "Moving Average Crossover (13/55)",
@@ -121,6 +132,12 @@ class StrategyParameters:
     rsi_upper: float = 70.0
     bollinger_window: int = 20
     bollinger_width: float = 2.0
+    momentum_window: int = 12
+    mean_reversion_window: int = 20
+    breakout_lookback: int = 20
+
+    def to_dict(self) -> Dict[str, float]:
+        return asdict(self)
 
 
 def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParameters:
@@ -131,19 +148,20 @@ def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParame
 
     short_window = max(1, int(params.short_window))
     long_window = max(short_window + 1, int(params.long_window))
-    rsi_lower = float(params.rsi_lower)
-    rsi_upper = float(params.rsi_upper)
-    if rsi_lower < 0:
-        rsi_lower = 0.0
-    if rsi_upper > 100:
-        rsi_upper = 100.0
+
+    rsi_lower = max(0.0, float(params.rsi_lower))
+    rsi_upper = min(100.0, float(params.rsi_upper))
     if rsi_lower >= rsi_upper:
-        midpoint = (rsi_lower + rsi_upper) / 2 if rsi_upper > 0 else 50
-        rsi_lower = max(0.0, midpoint - 10)
-        rsi_upper = min(100.0, midpoint + 10)
+        midpoint = max(1.0, (rsi_lower + rsi_upper) / 2.0)
+        rsi_lower = max(0.0, midpoint - 10.0)
+        rsi_upper = min(100.0, midpoint + 10.0)
 
     bollinger_window = max(1, int(params.bollinger_window))
     bollinger_width = max(0.1, float(params.bollinger_width))
+
+    momentum_window = max(1, int(params.momentum_window))
+    mean_reversion_window = max(1, int(params.mean_reversion_window))
+    breakout_lookback = max(1, int(params.breakout_lookback))
 
     return StrategyParameters(
         short_window=short_window,
@@ -152,11 +170,18 @@ def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParame
         rsi_upper=rsi_upper,
         bollinger_window=bollinger_window,
         bollinger_width=bollinger_width,
+        momentum_window=momentum_window,
+        mean_reversion_window=mean_reversion_window,
+        breakout_lookback=breakout_lookback,
     )
 
 
 def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
     """Ensure essential OHLC columns exist by backfilling from available data."""
+
+    if data is None or data.empty:
+        raise ValueError("Price data is empty.")
+
     df = data.copy()
     if "Adj Close" not in df.columns:
         if "Close" in df.columns:
@@ -173,6 +198,8 @@ def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
         df["Open"] = df["Close"]
     if "Volume" not in df.columns:
         df["Volume"] = 0
+
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.ffill().bfill()
     return df
 
@@ -248,6 +275,104 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
     return _ensure_price_columns(raw)
 
 
+StrategyHandler = Callable[[pd.DataFrame, StrategyParameters], Tuple[pd.Series, Dict[str, pd.Series]]]
+
+
+def _strategy_buy_and_hold(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    signals = pd.Series(1.0, index=df.index, dtype=float)
+    return signals, {}
+
+
+def _strategy_moving_average(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    short = df["Adj Close"].rolling(window=params.short_window, min_periods=1).mean()
+    long = df["Adj Close"].rolling(window=params.long_window, min_periods=1).mean()
+    signals = pd.Series(np.where(short > long, 1.0, 0.0), index=df.index, dtype=float)
+    return signals, {"SMA_Short": short, "SMA_Long": long}
+
+
+def _strategy_rsi(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    rsi_indicator = ta.momentum.RSIIndicator(close=df["Adj Close"], window=14, fillna=True)
+    rsi = rsi_indicator.rsi().clip(0, 100)
+    raw_signal = np.where(
+        rsi < params.rsi_lower,
+        1.0,
+        np.where(rsi > params.rsi_upper, 0.0, np.nan),
+    )
+    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    return signals, {"RSI": rsi}
+
+
+def _strategy_macd(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    macd_indicator = ta.trend.MACD(close=df["Adj Close"], window_slow=26, window_fast=12, window_sign=9, fillna=True)
+    macd = macd_indicator.macd()
+    macd_signal = macd_indicator.macd_signal()
+    macd_hist = macd_indicator.macd_diff()
+    signals = pd.Series(np.where(macd_hist > 0, 1.0, 0.0), index=df.index, dtype=float)
+    return signals, {"MACD": macd, "MACD_Signal": macd_signal, "MACD_Hist": macd_hist}
+
+
+def _strategy_bollinger(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    bb_indicator = ta.volatility.BollingerBands(
+        close=df["Adj Close"],
+        window=params.bollinger_window,
+        window_dev=params.bollinger_width,
+        fillna=True,
+    )
+    middle = bb_indicator.bollinger_mavg()
+    upper = bb_indicator.bollinger_hband()
+    lower = bb_indicator.bollinger_lband()
+    long_signal = df["Adj Close"] < lower
+    flat_signal = df["Adj Close"] > upper
+    raw_signal = np.where(long_signal, 1.0, np.where(flat_signal, 0.0, np.nan))
+    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    return signals, {"BB_Middle": middle, "BB_Upper": upper, "BB_Lower": lower}
+
+
+def _strategy_momentum(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    roc_indicator = ta.momentum.ROCIndicator(close=df["Adj Close"], window=params.momentum_window, fillna=True)
+    roc = roc_indicator.roc()
+    signals = pd.Series(np.where(roc > 0, 1.0, 0.0), index=df.index, dtype=float)
+    return signals, {"ROC": roc}
+
+
+def _strategy_mean_reversion(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    sma = df["Adj Close"].rolling(window=params.mean_reversion_window, min_periods=1).mean()
+    signals = pd.Series(np.where(df["Adj Close"] < sma, 1.0, 0.0), index=df.index, dtype=float)
+    return signals, {"MeanReversionSMA": sma}
+
+
+def _strategy_golden_cross(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    sma_50 = df["Adj Close"].rolling(window=50, min_periods=1).mean()
+    sma_200 = df["Adj Close"].rolling(window=200, min_periods=1).mean()
+    signals = pd.Series(np.where(sma_50 > sma_200, 1.0, 0.0), index=df.index, dtype=float)
+    return signals, {"SMA_50": sma_50, "SMA_200": sma_200}
+
+
+def _strategy_breakout(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+    high = df["High"].rolling(window=params.breakout_lookback, min_periods=1).max()
+    low = df["Low"].rolling(window=params.breakout_lookback, min_periods=1).min()
+    raw_signal = np.where(
+        df["Close"] > high.shift(1),
+        1.0,
+        np.where(df["Close"] < low.shift(1), 0.0, np.nan),
+    )
+    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    return signals, {"Breakout_High": high, "Breakout_Low": low}
+
+
+STRATEGY_REGISTRY: Dict[str, StrategyHandler] = {
+    "Buy and Hold": _strategy_buy_and_hold,
+    "Moving Average Crossover (13/55)": _strategy_moving_average,
+    "RSI Strategy": _strategy_rsi,
+    "MACD Strategy": _strategy_macd,
+    "Bollinger Bands": _strategy_bollinger,
+    "Momentum": _strategy_momentum,
+    "Mean Reversion": _strategy_mean_reversion,
+    "Golden/Death Cross": _strategy_golden_cross,
+    "Breakout": _strategy_breakout,
+}
+
+
 def apply_strategy(
     data: pd.DataFrame, strategy: str, params: Optional[StrategyParameters] = None
 ) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
@@ -261,82 +386,15 @@ def apply_strategy(
     params = _sanitize_parameters(params)
 
     df["Return"] = _clean_numeric_series(df["Adj Close"].pct_change(), fill_value=0.0)
-    signals = pd.Series(0.0, index=df.index, dtype=float)
 
-    strategy = strategy.strip()
-
-    if strategy == "Buy and Hold":
-        signals.loc[:] = 1.0
-
-    elif strategy == "Moving Average Crossover (13/55)":
-        df["SMA_Short"] = df["Adj Close"].rolling(window=params.short_window, min_periods=1).mean()
-        df["SMA_Long"] = df["Adj Close"].rolling(window=params.long_window, min_periods=1).mean()
-        signals = pd.Series(
-            np.where(df["SMA_Short"] > df["SMA_Long"], 1.0, 0.0),
-            index=df.index,
-            dtype=float,
-        )
-
-    elif strategy == "RSI Strategy":
-        rsi_indicator = ta.momentum.RSIIndicator(close=df["Adj Close"], window=14, fillna=True)
-        df["RSI"] = rsi_indicator.rsi().clip(0, 100)
-        raw_signal = np.where(
-            df["RSI"] < params.rsi_lower,
-            1.0,
-            np.where(df["RSI"] > params.rsi_upper, 0.0, np.nan),
-        )
-        signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
-
-    elif strategy == "MACD Strategy":
-        macd_indicator = ta.trend.MACD(close=df["Adj Close"], window_slow=26, window_fast=12, window_sign=9, fillna=True)
-        df["MACD"] = macd_indicator.macd()
-        df["MACD_Signal"] = macd_indicator.macd_signal()
-        df["MACD_Hist"] = macd_indicator.macd_diff()
-        signals = pd.Series(np.where(df["MACD_Hist"] > 0, 1.0, 0.0), index=df.index, dtype=float)
-
-    elif strategy == "Bollinger Bands":
-        bb_indicator = ta.volatility.BollingerBands(
-            close=df["Adj Close"],
-            window=params.bollinger_window,
-            window_dev=params.bollinger_width,
-            fillna=True,
-        )
-        df["BB_Middle"] = bb_indicator.bollinger_mavg()
-        df["BB_Upper"] = bb_indicator.bollinger_hband()
-        df["BB_Lower"] = bb_indicator.bollinger_lband()
-        long_signal = df["Adj Close"] < df["BB_Lower"]
-        flat_signal = df["Adj Close"] > df["BB_Upper"]
-        raw_signal = np.where(long_signal, 1.0, np.where(flat_signal, 0.0, np.nan))
-        signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
-
-    elif strategy == "Momentum":
-        roc_indicator = ta.momentum.ROCIndicator(close=df["Adj Close"], window=12, fillna=True)
-        df["ROC"] = roc_indicator.roc()
-        signals = pd.Series(np.where(df["ROC"] > 0, 1.0, 0.0), index=df.index, dtype=float)
-
-    elif strategy == "Mean Reversion":
-        df["SMA_20"] = df["Adj Close"].rolling(window=20, min_periods=1).mean()
-        signals = pd.Series(np.where(df["Adj Close"] < df["SMA_20"], 1.0, 0.0), index=df.index, dtype=float)
-
-    elif strategy == "Golden/Death Cross":
-        df["SMA_50"] = df["Adj Close"].rolling(window=50, min_periods=1).mean()
-        df["SMA_200"] = df["Adj Close"].rolling(window=200, min_periods=1).mean()
-        signals = pd.Series(np.where(df["SMA_50"] > df["SMA_200"], 1.0, 0.0), index=df.index, dtype=float)
-
-    elif strategy == "Breakout":
-        df["High_20"] = df["High"].rolling(window=20, min_periods=1).max()
-        df["Low_20"] = df["Low"].rolling(window=20, min_periods=1).min()
-        raw_signal = np.where(
-            df["Close"] > df["High_20"].shift(1),
-            1.0,
-            np.where(df["Close"] < df["Low_20"].shift(1), 0.0, np.nan),
-        )
-        signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
-
-    else:
+    handler = STRATEGY_REGISTRY.get(strategy.strip())
+    if handler is None:
         raise ValueError(f"Unsupported strategy: {strategy}")
 
-    signals = signals.clip(lower=0.0, upper=1.0)
+    signals, extra_columns = handler(df, params)
+    signals = signals.astype(float).clip(lower=0.0, upper=1.0)
+    signals = signals.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+
     positions = signals.shift(1).fillna(0.0)
     strategy_returns = _clean_numeric_series(positions * df["Return"], fill_value=0.0)
 
@@ -344,6 +402,8 @@ def apply_strategy(
     buy_hold_curve = _compute_equity_curve(df["Return"])
 
     results = df.copy()
+    for name, values in extra_columns.items():
+        results[name] = values
     results["Signal"] = signals
     results["Position"] = positions
     results["Strategy Return"] = strategy_returns
@@ -355,7 +415,10 @@ def apply_strategy(
 
 
 def compute_metrics(
-    equity_curve: pd.Series, buy_hold_curve: pd.Series, strategy_returns: pd.Series
+    equity_curve: pd.Series,
+    buy_hold_curve: pd.Series,
+    strategy_returns: pd.Series,
+    benchmark_curve: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     if equity_curve.empty or buy_hold_curve.empty:
         raise ValueError("Equity curves are empty; cannot compute performance metrics.")
@@ -433,6 +496,18 @@ def compute_metrics(
         },
     ]
 
+    if benchmark_curve is not None and not benchmark_curve.empty:
+        benchmark_clean = benchmark_curve.replace([np.inf, -np.inf], np.nan).ffill().dropna()
+        if not benchmark_clean.empty:
+            benchmark_return = benchmark_clean.iloc[-1] - 1.0
+            metrics_data.append(
+                {
+                    "Metric": "Benchmark Total Return",
+                    "RawValue": _safe_value(benchmark_return),
+                    "Display": _format_percentage(benchmark_return),
+                }
+            )
+
     return pd.DataFrame(metrics_data)
 
 
@@ -445,71 +520,76 @@ def _add_indicator_layers(
     if {"SMA_Short", "SMA_Long"}.issubset(price_df.columns):
         layers.append(
             alt.Chart(price_df)
-            .mark_line(color="#ff7f0e")
-            .encode(
-                x="Date:T",
-                y="SMA_Short:Q",
-                tooltip=[
-                    "Date:T",
-                    alt.Tooltip("SMA_Short:Q", format=".2f", title=f"SMA {params.short_window}"),
-                ],
-            )
+            .mark_line(color="#ff7f0e", strokeDash=[4, 2])
+            .encode(x="Date:T", y="SMA_Short:Q", tooltip=["Date:T", alt.Tooltip("SMA_Short:Q", format=".2f", title="SMA Short")])
         )
         layers.append(
             alt.Chart(price_df)
-            .mark_line(color="#2ca02c")
-            .encode(
-                x="Date:T",
-                y="SMA_Long:Q",
-                tooltip=[
-                    "Date:T",
-                    alt.Tooltip("SMA_Long:Q", format=".2f", title=f"SMA {params.long_window}"),
-                ],
-            )
+            .mark_line(color="#2ca02c", strokeDash=[2, 2])
+            .encode(x="Date:T", y="SMA_Long:Q", tooltip=["Date:T", alt.Tooltip("SMA_Long:Q", format=".2f", title="SMA Long")])
         )
 
-    if {"SMA_50", "SMA_200"}.issubset(price_df.columns):
+    if {"BB_Upper", "BB_Lower"}.issubset(price_df.columns):
         layers.append(
             alt.Chart(price_df)
-            .mark_line(color="#9467bd", strokeDash=[5, 2])
-            .encode(x="Date:T", y="SMA_50:Q", tooltip=["Date:T", alt.Tooltip("SMA_50:Q", format=".2f", title="SMA 50")])
-        )
-        layers.append(
-            alt.Chart(price_df)
-            .mark_line(color="#8c564b", strokeDash=[3, 2])
-            .encode(x="Date:T", y="SMA_200:Q", tooltip=["Date:T", alt.Tooltip("SMA_200:Q", format=".2f", title="SMA 200")])
-        )
-
-    if {"BB_Middle", "BB_Upper", "BB_Lower"}.issubset(price_df.columns):
-        band = (
-            alt.Chart(price_df)
-            .mark_area(color="#c6dbef", opacity=0.4)
+            .mark_area(color="#c6dbef", opacity=0.3)
             .encode(x="Date:T", y="BB_Lower:Q", y2="BB_Upper:Q")
         )
-        layers.append(band)
         layers.append(
             alt.Chart(price_df)
-            .mark_line(color="#1f77b4", strokeDash=[4, 2])
+            .mark_line(color="#9467bd")
             .encode(x="Date:T", y="BB_Middle:Q", tooltip=["Date:T", alt.Tooltip("BB_Middle:Q", format=".2f", title="BB Middle")])
-        )
-
-    if "SMA_20" in price_df.columns and strategy == "Mean Reversion":
-        layers.append(
-            alt.Chart(price_df)
-            .mark_line(color="#bcbd22")
-            .encode(x="Date:T", y="SMA_20:Q", tooltip=["Date:T", alt.Tooltip("SMA_20:Q", format=".2f", title="SMA 20")])
         )
 
     if "ROC" in price_df.columns:
         requires_secondary_axis = True
         layers.append(
             alt.Chart(price_df)
-            .mark_line(color="#17becf", strokeDash=[2, 2])
+            .mark_line(color="#17becf")
             .encode(
                 x="Date:T",
-                y=alt.Y("ROC:Q", axis=alt.Axis(title="ROC", titleColor="#17becf"), scale=alt.Scale(zero=False)),
+                y=alt.Y(
+                    "ROC:Q",
+                    axis=alt.Axis(title="ROC", titleColor="#17becf"),
+                    scale=alt.Scale(zero=False),
+                ),
                 tooltip=["Date:T", alt.Tooltip("ROC:Q", format=".2f")],
             )
+        )
+
+    if "MeanReversionSMA" in price_df.columns:
+        layers.append(
+            alt.Chart(price_df)
+            .mark_line(color="#bcbd22", strokeDash=[5, 3])
+            .encode(
+                x="Date:T",
+                y="MeanReversionSMA:Q",
+                tooltip=["Date:T", alt.Tooltip("MeanReversionSMA:Q", format=".2f", title="Mean Reversion SMA")],
+            )
+        )
+
+    if {"SMA_50", "SMA_200"}.issubset(price_df.columns):
+        layers.append(
+            alt.Chart(price_df)
+            .mark_line(color="#ff9896", strokeDash=[4, 4])
+            .encode(x="Date:T", y="SMA_50:Q", tooltip=["Date:T", alt.Tooltip("SMA_50:Q", format=".2f", title="50D SMA")])
+        )
+        layers.append(
+            alt.Chart(price_df)
+            .mark_line(color="#8c564b", strokeDash=[6, 3])
+            .encode(x="Date:T", y="SMA_200:Q", tooltip=["Date:T", alt.Tooltip("SMA_200:Q", format=".2f", title="200D SMA")])
+        )
+
+    if {"Breakout_High", "Breakout_Low"}.issubset(price_df.columns):
+        layers.append(
+            alt.Chart(price_df)
+            .mark_line(color="#1f77b4", strokeDash=[2, 1])
+            .encode(x="Date:T", y="Breakout_High:Q", tooltip=["Date:T", alt.Tooltip("Breakout_High:Q", format=".2f", title="High Lookback")])
+        )
+        layers.append(
+            alt.Chart(price_df)
+            .mark_line(color="#d62728", strokeDash=[2, 1])
+            .encode(x="Date:T", y="Breakout_Low:Q", tooltip=["Date:T", alt.Tooltip("Breakout_Low:Q", format=".2f", title="Low Lookback")])
         )
 
     if "RSI" in price_df.columns:
@@ -519,7 +599,11 @@ def _add_indicator_layers(
             .mark_line(color="#d62728")
             .encode(
                 x="Date:T",
-                y=alt.Y("RSI:Q", axis=alt.Axis(title="RSI", titleColor="#d62728"), scale=alt.Scale(domain=[0, 100])),
+                y=alt.Y(
+                    "RSI:Q",
+                    axis=alt.Axis(title="RSI", titleColor="#d62728"),
+                    scale=alt.Scale(domain=[0, 100]),
+                ),
                 tooltip=["Date:T", alt.Tooltip("RSI:Q", format=".2f")],
             )
         )
@@ -546,22 +630,24 @@ def _add_indicator_layers(
             .mark_line(color="#8c564b", strokeDash=[4, 2])
             .encode(
                 x="Date:T",
-                y=alt.Y("MACD_Signal:Q", axis=alt.Axis(title="MACD Signal", titleColor="#8c564b"), scale=alt.Scale(zero=False)),
+                y=alt.Y(
+                    "MACD_Signal:Q",
+                    axis=alt.Axis(title="Signal", titleColor="#8c564b"),
+                    scale=alt.Scale(zero=False),
+                ),
                 tooltip=["Date:T", alt.Tooltip("MACD_Signal:Q", format=".2f")],
             )
         )
-
-    if {"High_20", "Low_20"}.issubset(price_df.columns):
-        layers.append(
-            alt.Chart(price_df)
-            .mark_line(color="#ff9896", strokeDash=[6, 2])
-            .encode(x="Date:T", y="High_20:Q", tooltip=["Date:T", alt.Tooltip("High_20:Q", format=".2f", title="20D High")])
-        )
-        layers.append(
-            alt.Chart(price_df)
-            .mark_line(color="#c5b0d5", strokeDash=[6, 2])
-            .encode(x="Date:T", y="Low_20:Q", tooltip=["Date:T", alt.Tooltip("Low_20:Q", format=".2f", title="20D Low")])
-        )
+        if "MACD_Hist" in price_df.columns:
+            layers.append(
+                alt.Chart(price_df)
+                .mark_bar(color="#c5b0d5", opacity=0.5)
+                .encode(
+                    x="Date:T",
+                    y=alt.Y("MACD_Hist:Q", axis=alt.Axis(title="Histogram"), scale=alt.Scale(zero=False)),
+                    tooltip=["Date:T", alt.Tooltip("MACD_Hist:Q", format=".2f", title="MACD Hist")],
+                )
+            )
 
     return layers, requires_secondary_axis
 
@@ -607,7 +693,11 @@ def build_price_chart(
             .encode(
                 x="Date:T",
                 y="Adj Close:Q",
-                tooltip=["Date:T", alt.Tooltip("Adj Close:Q", format=".2f"), alt.Tooltip("Position:Q", title="Position")],
+                tooltip=[
+                    "Date:T",
+                    alt.Tooltip("Adj Close:Q", format=".2f"),
+                    alt.Tooltip("Position:Q", title="Position"),
+                ],
             )
         )
 
@@ -618,7 +708,11 @@ def build_price_chart(
             .encode(
                 x="Date:T",
                 y="Adj Close:Q",
-                tooltip=["Date:T", alt.Tooltip("Adj Close:Q", format=".2f"), alt.Tooltip("Position:Q", title="Position")],
+                tooltip=[
+                    "Date:T",
+                    alt.Tooltip("Adj Close:Q", format=".2f"),
+                    alt.Tooltip("Position:Q", title="Position"),
+                ],
             )
         )
 
@@ -663,6 +757,40 @@ def build_equity_chart(
     )
 
 
+def _create_download_package(results: pd.DataFrame, metrics: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        results_csv = results.reset_index().to_csv(index=False)
+        metrics_csv = metrics.to_csv(index=False)
+        zip_file.writestr("results.csv", results_csv)
+        zip_file.writestr("metrics.csv", metrics_csv)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _prepare_benchmark_curve(
+    ticker: str,
+    start_date: date,
+    end_date: date,
+    align_index: Iterable[pd.Timestamp],
+) -> Tuple[Optional[pd.Series], Optional[str]]:
+    if not ticker:
+        return None, None
+
+    try:
+        benchmark_data = download_data(ticker, start_date, end_date)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+
+    benchmark_returns = _clean_numeric_series(benchmark_data["Adj Close"].pct_change(), fill_value=0.0)
+    benchmark_curve = _compute_equity_curve(benchmark_returns)
+    benchmark_curve = benchmark_curve.reindex(pd.Index(align_index)).ffill().bfill()
+    if benchmark_curve.isna().all():
+        return None, "Benchmark data contained only missing values."
+
+    return benchmark_curve, None
+
+
 def _render_app() -> None:
     st.title("ASX Stock Strategy Backtester")
     st.caption("Historical performance does not guarantee future results. Use for educational purposes only.")
@@ -671,10 +799,13 @@ def _render_app() -> None:
         st.header("Backtest Settings")
         selected_common = st.selectbox("Common Tickers", options=COMMON_TICKERS, index=0)
         custom_ticker = st.text_input("Custom Ticker (optional)", value="")
-        benchmark_options = ["None", "XJO.AX"] + [ticker for ticker in COMMON_TICKERS if ticker != selected_common]
-        benchmark_choice = st.selectbox("Benchmark Ticker", options=benchmark_options, index=0)
+
+        benchmark_candidates = ["None"] + [ticker for ticker in DEFAULT_BENCHMARKS + COMMON_TICKERS if ticker != selected_common]
+        benchmark_choice = st.selectbox("Benchmark Ticker", options=benchmark_candidates, index=0)
         benchmark_custom = st.text_input("Custom Benchmark (optional)", value="")
-        start_date = st.date_input("Start Date", value=date(2015, 1, 1))
+
+        default_start = max(date(2000, 1, 1), date.today() - timedelta(days=365 * 5))
+        start_date = st.date_input("Start Date", value=default_start)
         end_date = st.date_input("End Date", value=date.today())
         strategy_choice = st.selectbox("Strategy", STRATEGY_OPTIONS)
 
@@ -709,17 +840,27 @@ def _render_app() -> None:
             bollinger_width_input = float(
                 st.number_input("Bollinger Band Width", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
             )
+            momentum_window_input = int(
+                st.number_input("Momentum Window", min_value=1, max_value=252, value=12, step=1)
+            )
+            mean_reversion_window_input = int(
+                st.number_input("Mean Reversion Window", min_value=1, max_value=252, value=20, step=1)
+            )
+            breakout_lookback_input = int(
+                st.number_input("Breakout Lookback", min_value=1, max_value=252, value=20, step=1)
+            )
 
         run_backtest = st.button("Run Backtest", type="primary")
 
     ticker = get_selected_ticker(selected_common, custom_ticker)
-    benchmark_custom = benchmark_custom.strip().upper()
     benchmark_choice = benchmark_choice.strip().upper()
-    benchmark_ticker = ""
+    benchmark_custom = benchmark_custom.strip().upper()
     if benchmark_custom:
         benchmark_ticker = benchmark_custom
     elif benchmark_choice and benchmark_choice != "NONE":
         benchmark_ticker = benchmark_choice
+    else:
+        benchmark_ticker = ""
 
     params = StrategyParameters(
         short_window=short_window_input,
@@ -728,9 +869,32 @@ def _render_app() -> None:
         rsi_upper=rsi_upper_input,
         bollinger_window=bollinger_window_input,
         bollinger_width=bollinger_width_input,
+        momentum_window=momentum_window_input,
+        mean_reversion_window=mean_reversion_window_input,
+        breakout_lookback=breakout_lookback_input,
     )
+    params = _sanitize_parameters(params)
 
     if run_backtest:
+        st.session_state["last_run"] = {
+            "ticker": ticker,
+            "benchmark": benchmark_ticker,
+            "start": start_date,
+            "end": end_date,
+            "strategy": strategy_choice,
+            "params": params,
+        }
+
+    last_run = st.session_state.get("last_run")
+    if last_run and not run_backtest:
+        ticker = last_run["ticker"]
+        benchmark_ticker = last_run["benchmark"]
+        start_date = last_run["start"]
+        end_date = last_run["end"]
+        strategy_choice = last_run["strategy"]
+        params = last_run["params"]
+
+    if run_backtest or last_run:
         try:
             price_data = download_data(ticker, start_date, end_date)
             results, equity_curve, buy_hold_curve = apply_strategy(price_data, strategy_choice, params)
@@ -738,23 +902,23 @@ def _render_app() -> None:
             if results.empty:
                 raise ValueError("No results generated for the selected parameters.")
 
-            metrics_table = compute_metrics(equity_curve, buy_hold_curve, results["Strategy Return"])
-
             benchmark_curve: Optional[pd.Series] = None
-            benchmark_label = benchmark_ticker if benchmark_ticker else "Benchmark"
+            benchmark_error: Optional[str] = None
             if benchmark_ticker and benchmark_ticker != ticker:
-                try:
-                    benchmark_data = download_data(benchmark_ticker, start_date, end_date)
-                    benchmark_returns = _clean_numeric_series(benchmark_data["Adj Close"].pct_change(), fill_value=0.0)
-                    benchmark_curve = _compute_equity_curve(benchmark_returns)
-                    benchmark_curve = benchmark_curve.reindex(results.index).ffill().bfill()
-                    if benchmark_curve.isna().all():
-                        benchmark_curve = None
-                    else:
-                        results[f"{benchmark_label} Equity"] = benchmark_curve
-                except Exception as bench_exc:  # noqa: BLE001
-                    benchmark_curve = None
-                    st.warning(f"Benchmark data unavailable: {bench_exc}")
+                benchmark_curve, benchmark_error = _prepare_benchmark_curve(
+                    benchmark_ticker, start_date, end_date, results.index
+                )
+                if benchmark_error:
+                    st.warning(f"Benchmark data unavailable: {benchmark_error}")
+                if benchmark_curve is not None:
+                    results[f"{benchmark_ticker} Equity"] = benchmark_curve
+
+            metrics_table = compute_metrics(
+                equity_curve,
+                buy_hold_curve,
+                results["Strategy Return"],
+                benchmark_curve=benchmark_curve,
+            )
 
             st.success(f"Backtest completed for {ticker} using the {strategy_choice} strategy.")
 
@@ -768,20 +932,21 @@ def _render_app() -> None:
                     buy_hold_curve,
                     strategy_choice,
                     benchmark_curve=benchmark_curve,
-                    benchmark_label=benchmark_label,
+                    benchmark_label=benchmark_ticker or "Benchmark",
                 ),
                 use_container_width=True,
             )
 
-            st.subheader("Performance Metrics")
             metrics_lookup = metrics_table.set_index("Metric")
-            buy_hold_total_raw = metrics_lookup.loc["Buy & Hold Total Return", "RawValue"]
             strategy_total_raw = metrics_lookup.loc["Strategy Total Return", "RawValue"]
+            buy_hold_total_raw = metrics_lookup.loc["Buy & Hold Total Return", "RawValue"]
             total_delta = (
                 _format_percentage(strategy_total_raw - buy_hold_total_raw)
                 if np.isfinite(strategy_total_raw) and np.isfinite(buy_hold_total_raw)
                 else None
             )
+
+            st.subheader("Key Performance Metrics")
             summary_cols = st.columns(3)
             summary_cols[0].metric(
                 "Total Return",
@@ -793,14 +958,10 @@ def _render_app() -> None:
 
             st.dataframe(metrics_lookup[["Display"]].rename(columns={"Display": "Value"}))
 
-            export_buffer = io.BytesIO()
-            with zipfile.ZipFile(export_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                zip_file.writestr("results.csv", results.to_csv(index=True))
-                zip_file.writestr("metrics.csv", metrics_table.to_csv(index=False))
-            export_buffer.seek(0)
+            export_data = _create_download_package(results, metrics_table)
             st.download_button(
                 label="Download Results & Metrics (ZIP)",
-                data=export_buffer.getvalue(),
+                data=export_data,
                 file_name=f"backtest_{ticker}_{strategy_choice.replace(' ', '_').lower()}.zip",
                 mime="application/zip",
             )
@@ -871,6 +1032,9 @@ def _run_self_tests() -> None:
                 rsi_upper=75.0,
                 bollinger_window=15,
                 bollinger_width=2.5,
+                momentum_window=10,
+                mean_reversion_window=15,
+                breakout_lookback=15,
             )
 
         def test_download_data_success(self) -> None:
@@ -901,12 +1065,29 @@ def _run_self_tests() -> None:
             results, equity_curve, buy_hold_curve = apply_strategy(
                 self.mock_data, "Buy and Hold", self.custom_params
             )
-            metrics = compute_metrics(equity_curve, buy_hold_curve, results["Strategy Return"])
+            metrics = compute_metrics(
+                equity_curve,
+                buy_hold_curve,
+                results["Strategy Return"],
+            )
             self.assertFalse(metrics.empty)
             self.assertIn("Metric", metrics.columns)
             self.assertIn("RawValue", metrics.columns)
             self.assertIn("Display", metrics.columns)
             self.assertTrue(all(isinstance(val, str) for val in metrics["Display"]))
+
+        def test_compute_metrics_with_benchmark(self) -> None:
+            results, equity_curve, buy_hold_curve = apply_strategy(
+                self.mock_data, "Momentum", self.custom_params
+            )
+            benchmark_curve = buy_hold_curve * 1.01
+            metrics = compute_metrics(
+                equity_curve,
+                buy_hold_curve,
+                results["Strategy Return"],
+                benchmark_curve=benchmark_curve,
+            )
+            self.assertIn("Benchmark Total Return", metrics["Metric"].values)
 
         def test_compute_metrics_handles_non_positive_cagr(self) -> None:
             dates = pd.date_range("2021-01-01", periods=2, freq="B")
@@ -918,7 +1099,7 @@ def _run_self_tests() -> None:
             self.assertEqual(cagr_display, "N/A")
 
         def test_build_price_chart(self) -> None:
-            results, equity_curve, buy_hold_curve = apply_strategy(
+            results, _, _ = apply_strategy(
                 self.mock_data, "Momentum", self.custom_params
             )
             chart = build_price_chart(results, "Momentum", self.custom_params)
@@ -942,6 +1123,38 @@ def _run_self_tests() -> None:
             self.assertIsInstance(chart_dict, dict)
             self.assertIn("data", chart_dict)
 
+        def test_download_package_contains_files(self) -> None:
+            results, equity_curve, buy_hold_curve = apply_strategy(
+                self.mock_data, "Buy and Hold", self.custom_params
+            )
+            metrics = compute_metrics(
+                equity_curve,
+                buy_hold_curve,
+                results["Strategy Return"],
+            )
+            zip_bytes = _create_download_package(results, metrics)
+            with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_file:
+                self.assertIn("results.csv", zip_file.namelist())
+                self.assertIn("metrics.csv", zip_file.namelist())
+
+        def test_parameter_sanitization(self) -> None:
+            dirty_params = StrategyParameters(
+                short_window=-5,
+                long_window=3,
+                rsi_lower=90,
+                rsi_upper=20,
+                bollinger_window=0,
+                bollinger_width=-1,
+                momentum_window=0,
+                mean_reversion_window=-10,
+                breakout_lookback=0,
+            )
+            clean_params = _sanitize_parameters(dirty_params)
+            self.assertGreater(clean_params.long_window, clean_params.short_window)
+            self.assertLess(clean_params.rsi_lower, clean_params.rsi_upper)
+            self.assertGreater(clean_params.bollinger_window, 0)
+            self.assertGreater(clean_params.bollinger_width, 0)
+
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(BacktesterTests)
     runner = unittest.TextTestRunner(verbosity=0)
     result = runner.run(suite)
@@ -956,4 +1169,7 @@ def main() -> None:
 if __name__ == "__main__":
     _run_self_tests()
     print("ALL TESTS PASSED")
-    main()
+    try:
+        main()
+    except Exception as exc:  # pragma: no cover - allow running without Streamlit runtime
+        print(f"Streamlit runtime not available outside `streamlit run`: {exc}")
