@@ -255,40 +255,19 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
-def _call_with_optional_repair(
-    func: Callable[..., pd.DataFrame], *, args: Tuple[object, ...] = (), kwargs: Optional[Dict[str, object]] = None
-) -> pd.DataFrame:
-    """Call yfinance functions with repair fallback when supported."""
-
-    if kwargs is None:
-        kwargs = {}
-    else:
-        kwargs = dict(kwargs)
-
-    try:
-        return func(*args, repair=True, **kwargs)
-    except TypeError as err:
-        if "repair" not in str(err):
-            raise
-    return func(*args, **kwargs)
-
-
 def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
     """Download price history with retry and fallback handling."""
 
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
-            data = _call_with_optional_repair(
-                yf.download,
-                args=(ticker,),
-                kwargs={
-                    "start": start,
-                    "progress": False,
-                    "auto_adjust": False,
-                    "rounding": True,
-                    "threads": False,
-                },
+            data = yf.download(
+                ticker,
+                start=start,
+                progress=False,
+                auto_adjust=False,
+                rounding=True,
+                threads=False,
             )
         except Exception as err:  # pragma: no cover - network dependent
             last_error = err
@@ -301,30 +280,14 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 
     ticker_client = yf.Ticker(ticker)
     try:
-        data = _call_with_optional_repair(
-            ticker_client.history,
-            kwargs={
-                "start": start,
-                "interval": "1d",
-                "auto_adjust": False,
-                "actions": False,
-            },
-        )
+        data = ticker_client.history(start=start, interval="1d", auto_adjust=False, actions=False)
     except Exception as err:  # pragma: no cover - network dependent
         last_error = err
         data = pd.DataFrame()
 
     if data.empty:
         try:
-            fallback = _call_with_optional_repair(
-                ticker_client.history,
-                kwargs={
-                    "period": "max",
-                    "interval": "1d",
-                    "auto_adjust": False,
-                    "actions": False,
-                },
-            )
+            fallback = ticker_client.history(period="max", interval="1d", auto_adjust=False, actions=False)
         except Exception as err:  # pragma: no cover - network dependent
             last_error = err
             fallback = pd.DataFrame()
