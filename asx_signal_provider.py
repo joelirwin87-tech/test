@@ -255,6 +255,29 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
+def _empty_metadata_frame(columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
+    """Return an empty metadata frame with the expected columns and index."""
+
+    default_columns: Tuple[str, ...] = (
+        "ticker",
+        "name",
+        "sector",
+        "market_cap_billion",
+        "exchange",
+        "type",
+    )
+    resolved_columns: Tuple[str, ...] = tuple(columns) if columns is not None else default_columns
+    frame = pd.DataFrame(columns=resolved_columns)
+
+    if "ticker" in frame.columns:
+        frame = frame.set_index("ticker", drop=False)
+
+    if "market_cap_billion" in frame.columns:
+        frame["market_cap_billion"] = frame["market_cap_billion"].astype(float)
+
+    return frame
+
+
 def _call_with_optional_repair(
     func: Callable[..., pd.DataFrame],
     *,
