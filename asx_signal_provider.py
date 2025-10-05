@@ -544,6 +544,16 @@ def _format_percentage(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+def _format_percentage_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    formatted = df.copy()
+    for column in columns:
+        if column in formatted.columns:
+            formatted[column] = formatted[column].apply(
+                lambda value: _format_percentage(value) if pd.notnull(value) else value
+            )
+    return formatted
+
+
 def build_streamlit_app() -> None:
     st.set_page_config(page_title="ASX200 Daily Signals", layout="wide")
     st.title("ASX200 Daily Golden Cross Signals")
@@ -624,16 +634,15 @@ def build_streamlit_app() -> None:
     if signals_df.empty:
         st.info("No actionable signals matched the historical filters today.")
     else:
-        display_df = signals_df.copy()
-        if "historical_win_rate" in display_df.columns:
-            display_df["historical_win_rate"] = display_df["historical_win_rate"].map(_format_percentage)
-        if "historical_cagr" in display_df.columns:
-            display_df["historical_cagr"] = display_df["historical_cagr"].map(_format_percentage)
+        display_df = _format_percentage_columns(
+            signals_df, ["historical_win_rate", "historical_cagr"]
+        )
         st.dataframe(display_df)
-        csv = signals_df.to_csv(index=False).encode("utf-8")
+        csv = display_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download Signals CSV", csv, file_name="asx_signals.csv", mime="text/csv")
         excel_buffer = io.BytesIO()
-        signals_df.to_excel(excel_buffer, index=False)
+        display_df.to_excel(excel_buffer, index=False)
+        excel_buffer.seek(0)
         st.download_button(
             "Download Signals Excel",
             excel_buffer.getvalue(),
@@ -646,12 +655,12 @@ def build_streamlit_app() -> None:
         if history_df.empty:
             st.info("Run the scan to generate historical statistics.")
         else:
-            display_history = history_df.copy()
-            for col in ["win_rate", "average_return", "cagr", "max_drawdown", "total_return"]:
-                if col in display_history.columns:
-                    display_history[col] = display_history[col].apply(lambda x: _format_percentage(x) if pd.notnull(x) else x)
+            display_history = _format_percentage_columns(
+                history_df,
+                ["win_rate", "average_return", "cagr", "max_drawdown", "total_return"],
+            )
             st.dataframe(display_history)
-            csv = history_df.to_csv(index=False).encode("utf-8")
+            csv = display_history.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download Historical Stats CSV",
                 csv,
@@ -659,7 +668,8 @@ def build_streamlit_app() -> None:
                 mime="text/csv",
             )
             excel_buffer = io.BytesIO()
-            history_df.to_excel(excel_buffer, index=False)
+            display_history.to_excel(excel_buffer, index=False)
+            excel_buffer.seek(0)
             st.download_button(
                 "Download Historical Stats Excel",
                 excel_buffer.getvalue(),
