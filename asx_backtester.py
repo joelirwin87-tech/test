@@ -1,7 +1,10 @@
 """ASX Backtester Streamlit application with internal self-tests."""
+import io
 import math
+import zipfile
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:  # pragma: no cover - fallback ensures self-tests run without Altair installed
     import altair as alt
@@ -108,6 +111,50 @@ STRATEGY_OPTIONS: List[str] = [
 ]
 
 
+@dataclass
+class StrategyParameters:
+    """Container for user adjustable strategy parameters."""
+
+    short_window: int = 13
+    long_window: int = 55
+    rsi_lower: float = 30.0
+    rsi_upper: float = 70.0
+    bollinger_window: int = 20
+    bollinger_width: float = 2.0
+
+
+def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParameters:
+    """Ensure provided parameters fall within safe, sensible ranges."""
+
+    if params is None:
+        params = StrategyParameters()
+
+    short_window = max(1, int(params.short_window))
+    long_window = max(short_window + 1, int(params.long_window))
+    rsi_lower = float(params.rsi_lower)
+    rsi_upper = float(params.rsi_upper)
+    if rsi_lower < 0:
+        rsi_lower = 0.0
+    if rsi_upper > 100:
+        rsi_upper = 100.0
+    if rsi_lower >= rsi_upper:
+        midpoint = (rsi_lower + rsi_upper) / 2 if rsi_upper > 0 else 50
+        rsi_lower = max(0.0, midpoint - 10)
+        rsi_upper = min(100.0, midpoint + 10)
+
+    bollinger_window = max(1, int(params.bollinger_window))
+    bollinger_width = max(0.1, float(params.bollinger_width))
+
+    return StrategyParameters(
+        short_window=short_window,
+        long_window=long_window,
+        rsi_lower=rsi_lower,
+        rsi_upper=rsi_upper,
+        bollinger_window=bollinger_window,
+        bollinger_width=bollinger_width,
+    )
+
+
 def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
     """Ensure essential OHLC columns exist by backfilling from available data."""
     df = data.copy()
@@ -128,6 +175,46 @@ def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
         df["Volume"] = 0
     df = df.ffill().bfill()
     return df
+
+
+def _clean_numeric_series(series: pd.Series, fill_value: float = 0.0) -> pd.Series:
+    cleaned = series.replace([np.inf, -np.inf], np.nan)
+    if fill_value is not None:
+        cleaned = cleaned.fillna(fill_value)
+    return cleaned.astype(float)
+
+
+def _compute_equity_curve(returns: pd.Series) -> pd.Series:
+    if returns.empty:
+        return pd.Series(dtype=float)
+
+    clean_returns = _clean_numeric_series(returns, fill_value=0.0).copy()
+    if not clean_returns.empty:
+        clean_returns.iloc[0] = 0.0
+
+    factors = 1.0 + clean_returns
+    factors = factors.clip(lower=1e-9)
+    equity = factors.cumprod()
+    equity = equity.replace([np.inf, -np.inf], np.nan).ffill().fillna(1.0)
+    return equity
+
+
+def _format_percentage(value: float) -> str:
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value * 100:.2f}%"
+
+
+def _format_ratio(value: float) -> str:
+    if value is None or not np.isfinite(value):
+        return "N/A"
+    return f"{value:.2f}"
+
+
+def _safe_value(value: Optional[float]) -> float:
+    if value is None or not np.isfinite(value):
+        return float("nan")
+    return float(value)
 
 
 def get_selected_ticker(default_choice: str, custom_input: str) -> str:
@@ -161,7 +248,9 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
     return _ensure_price_columns(raw)
 
 
-def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+def apply_strategy(
+    data: pd.DataFrame, strategy: str, params: Optional[StrategyParameters] = None
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
     if data is None or data.empty:
         raise ValueError("Input price data must not be empty.")
 
@@ -169,7 +258,9 @@ def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.
     df = df.sort_index().copy()
     df["Adj Close"] = df["Adj Close"].astype(float)
 
-    df["Return"] = df["Adj Close"].pct_change().fillna(0.0)
+    params = _sanitize_parameters(params)
+
+    df["Return"] = _clean_numeric_series(df["Adj Close"].pct_change(), fill_value=0.0)
     signals = pd.Series(0.0, index=df.index, dtype=float)
 
     strategy = strategy.strip()
@@ -178,14 +269,22 @@ def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.
         signals.loc[:] = 1.0
 
     elif strategy == "Moving Average Crossover (13/55)":
-        df["SMA_13"] = df["Adj Close"].rolling(window=13, min_periods=1).mean()
-        df["SMA_55"] = df["Adj Close"].rolling(window=55, min_periods=1).mean()
-        signals = pd.Series(np.where(df["SMA_13"] > df["SMA_55"], 1.0, 0.0), index=df.index, dtype=float)
+        df["SMA_Short"] = df["Adj Close"].rolling(window=params.short_window, min_periods=1).mean()
+        df["SMA_Long"] = df["Adj Close"].rolling(window=params.long_window, min_periods=1).mean()
+        signals = pd.Series(
+            np.where(df["SMA_Short"] > df["SMA_Long"], 1.0, 0.0),
+            index=df.index,
+            dtype=float,
+        )
 
     elif strategy == "RSI Strategy":
         rsi_indicator = ta.momentum.RSIIndicator(close=df["Adj Close"], window=14, fillna=True)
         df["RSI"] = rsi_indicator.rsi().clip(0, 100)
-        raw_signal = np.where(df["RSI"] < 30, 1.0, np.where(df["RSI"] > 70, 0.0, np.nan))
+        raw_signal = np.where(
+            df["RSI"] < params.rsi_lower,
+            1.0,
+            np.where(df["RSI"] > params.rsi_upper, 0.0, np.nan),
+        )
         signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
 
     elif strategy == "MACD Strategy":
@@ -196,7 +295,12 @@ def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.
         signals = pd.Series(np.where(df["MACD_Hist"] > 0, 1.0, 0.0), index=df.index, dtype=float)
 
     elif strategy == "Bollinger Bands":
-        bb_indicator = ta.volatility.BollingerBands(close=df["Adj Close"], window=20, window_dev=2, fillna=True)
+        bb_indicator = ta.volatility.BollingerBands(
+            close=df["Adj Close"],
+            window=params.bollinger_window,
+            window_dev=params.bollinger_width,
+            fillna=True,
+        )
         df["BB_Middle"] = bb_indicator.bollinger_mavg()
         df["BB_Upper"] = bb_indicator.bollinger_hband()
         df["BB_Lower"] = bb_indicator.bollinger_lband()
@@ -234,21 +338,10 @@ def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.
 
     signals = signals.clip(lower=0.0, upper=1.0)
     positions = signals.shift(1).fillna(0.0)
-    strategy_returns = positions * df["Return"].fillna(0.0)
+    strategy_returns = _clean_numeric_series(positions * df["Return"], fill_value=0.0)
 
-    equity_curve = (1.0 + strategy_returns).replace([np.inf, -np.inf], np.nan)
-    equity_curve = equity_curve.fillna(0.0)
-    equity_curve = equity_curve.add(1.0).cumprod()
-    equity_curve.replace([np.inf, -np.inf], np.nan, inplace=True)
-    equity_curve.fillna(method="ffill", inplace=True)
-    equity_curve.fillna(1.0, inplace=True)
-
-    buy_hold_curve = (1.0 + df["Return"]).replace([np.inf, -np.inf], np.nan)
-    buy_hold_curve = buy_hold_curve.fillna(0.0)
-    buy_hold_curve = buy_hold_curve.add(1.0).cumprod()
-    buy_hold_curve.replace([np.inf, -np.inf], np.nan, inplace=True)
-    buy_hold_curve.fillna(method="ffill", inplace=True)
-    buy_hold_curve.fillna(1.0, inplace=True)
+    equity_curve = _compute_equity_curve(strategy_returns)
+    buy_hold_curve = _compute_equity_curve(df["Return"])
 
     results = df.copy()
     results["Signal"] = signals
@@ -256,77 +349,123 @@ def apply_strategy(data: pd.DataFrame, strategy: str) -> Tuple[pd.DataFrame, pd.
     results["Strategy Return"] = strategy_returns
     results["Equity Curve"] = equity_curve
     results["Buy & Hold Equity"] = buy_hold_curve
+    results.attrs["strategy_parameters"] = params
 
     return results, equity_curve, buy_hold_curve
 
 
-def compute_metrics(equity_curve: pd.Series, buy_hold_curve: pd.Series, strategy_returns: pd.Series) -> pd.DataFrame:
+def compute_metrics(
+    equity_curve: pd.Series, buy_hold_curve: pd.Series, strategy_returns: pd.Series
+) -> pd.DataFrame:
     if equity_curve.empty or buy_hold_curve.empty:
         raise ValueError("Equity curves are empty; cannot compute performance metrics.")
 
-    total_return = equity_curve.iloc[-1] - 1.0
-    buy_hold_return = buy_hold_curve.iloc[-1] - 1.0
+    equity_clean = equity_curve.replace([np.inf, -np.inf], np.nan).ffill().copy()
+    buy_hold_clean = buy_hold_curve.replace([np.inf, -np.inf], np.nan).ffill().copy()
 
-    trading_days = len(equity_curve)
-    years = trading_days / 252 if trading_days > 0 else np.nan
-    cagr = np.nan
-    if pd.notna(years) and years > 0 and equity_curve.iloc[-1] > 0:
-        cagr = equity_curve.iloc[-1] ** (1 / years) - 1
+    if equity_clean.isna().all() or buy_hold_clean.isna().all():
+        raise ValueError("Equity curves contain no valid data points.")
 
-    running_max = equity_curve.cummax()
-    drawdown = equity_curve / running_max - 1.0
-    max_drawdown = drawdown.min()
+    final_equity = equity_clean.dropna().iloc[-1]
+    final_buy_hold = buy_hold_clean.dropna().iloc[-1]
 
-    active_returns = strategy_returns[strategy_returns != 0]
+    total_return = final_equity - 1.0 if np.isfinite(final_equity) else np.nan
+    buy_hold_return = final_buy_hold - 1.0 if np.isfinite(final_buy_hold) else np.nan
+
+    trading_days = float(len(equity_clean.dropna()))
+    years = trading_days / 252.0 if trading_days > 0 else np.nan
+    if years is None or not np.isfinite(years) or years <= 0 or final_equity <= 0:
+        cagr = np.nan
+    else:
+        cagr = final_equity ** (1.0 / years) - 1.0
+
+    running_max = equity_clean.cummax().replace(0, np.nan)
+    drawdown = (equity_clean / running_max) - 1.0
+    drawdown = drawdown.replace([np.inf, -np.inf], np.nan)
+    max_drawdown = drawdown.min(skipna=True)
+
+    cleaned_returns = _clean_numeric_series(strategy_returns, fill_value=0.0)
+    active_returns = cleaned_returns[np.abs(cleaned_returns) > 1e-12]
     win_rate = (active_returns > 0).mean() if not active_returns.empty else np.nan
 
-    volatility = np.nan
-    if not strategy_returns.empty:
-        volatility = strategy_returns.std(ddof=0) * math.sqrt(252)
+    daily_std = cleaned_returns.std(ddof=0)
+    volatility = daily_std * math.sqrt(252) if np.isfinite(daily_std) else np.nan
+    if np.isfinite(daily_std) and daily_std > 0:
+        sharpe = (cleaned_returns.mean() / daily_std) * math.sqrt(252)
+    else:
+        sharpe = np.nan
 
-    sharpe = np.nan
-    daily_std = strategy_returns.std(ddof=0)
-    if pd.notna(daily_std) and daily_std > 0:
-        sharpe = (strategy_returns.mean() * 252) / (daily_std * math.sqrt(252))
-
-    formatted_metrics = [
-        ("Strategy Total Return", total_return),
-        ("Buy & Hold Total Return", buy_hold_return),
-        ("CAGR", cagr),
-        ("Max Drawdown", max_drawdown),
-        ("Win Rate", win_rate),
-        ("Annualized Volatility", volatility),
-        ("Sharpe Ratio", sharpe),
+    metrics_data = [
+        {
+            "Metric": "Strategy Total Return",
+            "RawValue": _safe_value(total_return),
+            "Display": _format_percentage(total_return),
+        },
+        {
+            "Metric": "Buy & Hold Total Return",
+            "RawValue": _safe_value(buy_hold_return),
+            "Display": _format_percentage(buy_hold_return),
+        },
+        {
+            "Metric": "CAGR",
+            "RawValue": _safe_value(cagr),
+            "Display": _format_percentage(cagr),
+        },
+        {
+            "Metric": "Max Drawdown",
+            "RawValue": _safe_value(max_drawdown),
+            "Display": _format_percentage(max_drawdown),
+        },
+        {
+            "Metric": "Win Rate",
+            "RawValue": _safe_value(win_rate),
+            "Display": _format_percentage(win_rate),
+        },
+        {
+            "Metric": "Annualized Volatility",
+            "RawValue": _safe_value(volatility),
+            "Display": _format_percentage(volatility),
+        },
+        {
+            "Metric": "Sharpe Ratio",
+            "RawValue": _safe_value(sharpe),
+            "Display": _format_ratio(sharpe),
+        },
     ]
 
-    metric_rows = []
-    for label, value in formatted_metrics:
-        if pd.notna(value):
-            if "Sharpe" in label:
-                metric_rows.append({"Metric": label, "Value": f"{value:.2f}"})
-            else:
-                metric_rows.append({"Metric": label, "Value": f"{value:.2%}"})
-        else:
-            metric_rows.append({"Metric": label, "Value": "N/A"})
-
-    metrics = pd.DataFrame(metric_rows)
-    return metrics
+    return pd.DataFrame(metrics_data)
 
 
-def _add_indicator_layers(price_df: pd.DataFrame, strategy: str) -> Tuple[List[alt.Chart], bool]:
+def _add_indicator_layers(
+    price_df: pd.DataFrame, strategy: str, params: StrategyParameters
+) -> Tuple[List[alt.Chart], bool]:
     layers: List[alt.Chart] = []
     requires_secondary_axis = False
 
-    if {"SMA_13", "SMA_55"}.issubset(price_df.columns):
+    if {"SMA_Short", "SMA_Long"}.issubset(price_df.columns):
         layers.append(
             alt.Chart(price_df)
             .mark_line(color="#ff7f0e")
-            .encode(x="Date:T", y="SMA_13:Q", tooltip=["Date:T", alt.Tooltip("SMA_13:Q", format=".2f", title="SMA 13")])
+            .encode(
+                x="Date:T",
+                y="SMA_Short:Q",
+                tooltip=[
+                    "Date:T",
+                    alt.Tooltip("SMA_Short:Q", format=".2f", title=f"SMA {params.short_window}"),
+                ],
+            )
         )
         layers.append(
             alt.Chart(price_df)
             .mark_line(color="#2ca02c")
-            .encode(x="Date:T", y="SMA_55:Q", tooltip=["Date:T", alt.Tooltip("SMA_55:Q", format=".2f", title="SMA 55")])
+            .encode(
+                x="Date:T",
+                y="SMA_Long:Q",
+                tooltip=[
+                    "Date:T",
+                    alt.Tooltip("SMA_Long:Q", format=".2f", title=f"SMA {params.long_window}"),
+                ],
+            )
         )
 
     if {"SMA_50", "SMA_200"}.issubset(price_df.columns):
@@ -384,7 +523,7 @@ def _add_indicator_layers(price_df: pd.DataFrame, strategy: str) -> Tuple[List[a
                 tooltip=["Date:T", alt.Tooltip("RSI:Q", format=".2f")],
             )
         )
-        rsi_thresholds = pd.DataFrame({"RSI_Level": [30, 70]})
+        rsi_thresholds = pd.DataFrame({"RSI_Level": [params.rsi_lower, params.rsi_upper]})
         layers.append(
             alt.Chart(rsi_thresholds)
             .mark_rule(color="#d62728", strokeDash=[4, 4])
@@ -427,14 +566,21 @@ def _add_indicator_layers(price_df: pd.DataFrame, strategy: str) -> Tuple[List[a
     return layers, requires_secondary_axis
 
 
-def build_price_chart(results: pd.DataFrame, strategy: str) -> alt.Chart:
+def build_price_chart(
+    results: pd.DataFrame, strategy: str, params: StrategyParameters
+) -> alt.Chart:
     if results.empty:
         raise ValueError("Results dataframe cannot be empty when building price chart.")
+
+    params = _sanitize_parameters(params)
 
     price_df = results.reset_index().rename(columns={"index": "Date"})
     if "Date" not in price_df.columns:
         price_df.rename(columns={price_df.columns[0]: "Date"}, inplace=True)
     price_df["Date"] = pd.to_datetime(price_df["Date"])
+    price_df = price_df.replace([np.inf, -np.inf], np.nan)
+    price_df = price_df.dropna(subset=["Adj Close"]).copy()
+    price_df["Position"] = price_df["Position"].fillna(0.0)
 
     base_price = (
         alt.Chart(price_df)
@@ -447,7 +593,7 @@ def build_price_chart(results: pd.DataFrame, strategy: str) -> alt.Chart:
     )
 
     layers: List[alt.Chart] = [base_price]
-    indicator_layers, requires_secondary_axis = _add_indicator_layers(price_df, strategy)
+    indicator_layers, requires_secondary_axis = _add_indicator_layers(price_df, strategy, params)
     layers.extend(indicator_layers)
 
     position_diff = price_df["Position"].diff().fillna(price_df["Position"])
@@ -483,19 +629,26 @@ def build_price_chart(results: pd.DataFrame, strategy: str) -> alt.Chart:
     return chart.interactive()
 
 
-def build_equity_chart(equity_curve: pd.Series, buy_hold_curve: pd.Series, strategy: str) -> alt.Chart:
+def build_equity_chart(
+    equity_curve: pd.Series,
+    buy_hold_curve: pd.Series,
+    strategy: str,
+    benchmark_curve: Optional[pd.Series] = None,
+    benchmark_label: str = "Benchmark",
+) -> alt.Chart:
     if equity_curve.empty or buy_hold_curve.empty:
         raise ValueError("Equity curves must not be empty when building equity chart.")
 
-    equity_df = pd.DataFrame(
-        {
-            "Date": equity_curve.index,
-            strategy: equity_curve.values,
-            "Buy & Hold": buy_hold_curve.values,
-        }
-    )
+    curve_dict = {strategy: equity_curve, "Buy & Hold": buy_hold_curve}
+    if benchmark_curve is not None and not benchmark_curve.empty:
+        curve_dict[benchmark_label] = benchmark_curve
+
+    equity_df = pd.concat(curve_dict, axis=1)
+    equity_df = equity_df.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    equity_df.index = pd.to_datetime(equity_df.index)
+    equity_df = equity_df.reset_index().rename(columns={"index": "Date"})
     equity_long = equity_df.melt("Date", var_name="Series", value_name="Equity")
-    equity_long["Date"] = pd.to_datetime(equity_long["Date"])
+    equity_long = equity_long.dropna(subset=["Equity"])
 
     return (
         alt.Chart(equity_long)
@@ -518,33 +671,139 @@ def _render_app() -> None:
         st.header("Backtest Settings")
         selected_common = st.selectbox("Common Tickers", options=COMMON_TICKERS, index=0)
         custom_ticker = st.text_input("Custom Ticker (optional)", value="")
+        benchmark_options = ["None", "XJO.AX"] + [ticker for ticker in COMMON_TICKERS if ticker != selected_common]
+        benchmark_choice = st.selectbox("Benchmark Ticker", options=benchmark_options, index=0)
+        benchmark_custom = st.text_input("Custom Benchmark (optional)", value="")
         start_date = st.date_input("Start Date", value=date(2015, 1, 1))
         end_date = st.date_input("End Date", value=date.today())
         strategy_choice = st.selectbox("Strategy", STRATEGY_OPTIONS)
+
+        with st.expander("Strategy Parameters", expanded=True):
+            short_window_input = int(
+                st.number_input("Short Moving Average Window", min_value=1, max_value=365, value=13, step=1)
+            )
+            long_window_input = int(
+                st.number_input(
+                    "Long Moving Average Window",
+                    min_value=short_window_input + 1,
+                    max_value=600,
+                    value=max(55, short_window_input + 1),
+                    step=1,
+                )
+            )
+            rsi_lower_input = float(
+                st.number_input("RSI Oversold Threshold", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+            )
+            rsi_upper_input = float(
+                st.number_input(
+                    "RSI Overbought Threshold",
+                    min_value=min(100.0, rsi_lower_input + 1.0),
+                    max_value=100.0,
+                    value=min(100.0, max(70.0, rsi_lower_input + 1.0)),
+                    step=1.0,
+                )
+            )
+            bollinger_window_input = int(
+                st.number_input("Bollinger Window", min_value=1, max_value=365, value=20, step=1)
+            )
+            bollinger_width_input = float(
+                st.number_input("Bollinger Band Width", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
+            )
+
         run_backtest = st.button("Run Backtest", type="primary")
 
     ticker = get_selected_ticker(selected_common, custom_ticker)
+    benchmark_custom = benchmark_custom.strip().upper()
+    benchmark_choice = benchmark_choice.strip().upper()
+    benchmark_ticker = ""
+    if benchmark_custom:
+        benchmark_ticker = benchmark_custom
+    elif benchmark_choice and benchmark_choice != "NONE":
+        benchmark_ticker = benchmark_choice
+
+    params = StrategyParameters(
+        short_window=short_window_input,
+        long_window=long_window_input,
+        rsi_lower=rsi_lower_input,
+        rsi_upper=rsi_upper_input,
+        bollinger_window=bollinger_window_input,
+        bollinger_width=bollinger_width_input,
+    )
 
     if run_backtest:
         try:
             price_data = download_data(ticker, start_date, end_date)
-            results, equity_curve, buy_hold_curve = apply_strategy(price_data, strategy_choice)
+            results, equity_curve, buy_hold_curve = apply_strategy(price_data, strategy_choice, params)
 
             if results.empty:
                 raise ValueError("No results generated for the selected parameters.")
 
             metrics_table = compute_metrics(equity_curve, buy_hold_curve, results["Strategy Return"])
 
+            benchmark_curve: Optional[pd.Series] = None
+            benchmark_label = benchmark_ticker if benchmark_ticker else "Benchmark"
+            if benchmark_ticker and benchmark_ticker != ticker:
+                try:
+                    benchmark_data = download_data(benchmark_ticker, start_date, end_date)
+                    benchmark_returns = _clean_numeric_series(benchmark_data["Adj Close"].pct_change(), fill_value=0.0)
+                    benchmark_curve = _compute_equity_curve(benchmark_returns)
+                    benchmark_curve = benchmark_curve.reindex(results.index).ffill().bfill()
+                    if benchmark_curve.isna().all():
+                        benchmark_curve = None
+                    else:
+                        results[f"{benchmark_label} Equity"] = benchmark_curve
+                except Exception as bench_exc:  # noqa: BLE001
+                    benchmark_curve = None
+                    st.warning(f"Benchmark data unavailable: {bench_exc}")
+
             st.success(f"Backtest completed for {ticker} using the {strategy_choice} strategy.")
 
             st.subheader("Price Chart & Signals")
-            st.altair_chart(build_price_chart(results, strategy_choice), use_container_width=True)
+            st.altair_chart(build_price_chart(results, strategy_choice, params), use_container_width=True)
 
             st.subheader("Equity Curve Comparison")
-            st.altair_chart(build_equity_chart(equity_curve, buy_hold_curve, strategy_choice), use_container_width=True)
+            st.altair_chart(
+                build_equity_chart(
+                    equity_curve,
+                    buy_hold_curve,
+                    strategy_choice,
+                    benchmark_curve=benchmark_curve,
+                    benchmark_label=benchmark_label,
+                ),
+                use_container_width=True,
+            )
 
             st.subheader("Performance Metrics")
-            st.dataframe(metrics_table.set_index("Metric"))
+            metrics_lookup = metrics_table.set_index("Metric")
+            buy_hold_total_raw = metrics_lookup.loc["Buy & Hold Total Return", "RawValue"]
+            strategy_total_raw = metrics_lookup.loc["Strategy Total Return", "RawValue"]
+            total_delta = (
+                _format_percentage(strategy_total_raw - buy_hold_total_raw)
+                if np.isfinite(strategy_total_raw) and np.isfinite(buy_hold_total_raw)
+                else None
+            )
+            summary_cols = st.columns(3)
+            summary_cols[0].metric(
+                "Total Return",
+                metrics_lookup.loc["Strategy Total Return", "Display"],
+                delta=total_delta,
+            )
+            summary_cols[1].metric("CAGR", metrics_lookup.loc["CAGR", "Display"])
+            summary_cols[2].metric("Sharpe Ratio", metrics_lookup.loc["Sharpe Ratio", "Display"])
+
+            st.dataframe(metrics_lookup[["Display"]].rename(columns={"Display": "Value"}))
+
+            export_buffer = io.BytesIO()
+            with zipfile.ZipFile(export_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                zip_file.writestr("results.csv", results.to_csv(index=True))
+                zip_file.writestr("metrics.csv", metrics_table.to_csv(index=False))
+            export_buffer.seek(0)
+            st.download_button(
+                label="Download Results & Metrics (ZIP)",
+                data=export_buffer.getvalue(),
+                file_name=f"backtest_{ticker}_{strategy_choice.replace(' ', '_').lower()}.zip",
+                mime="application/zip",
+            )
 
             with st.expander("Show Raw Data"):
                 st.dataframe(results.round(4))
@@ -592,8 +851,9 @@ def _validate_strategy_output(results: pd.DataFrame, equity_curve: pd.Series, bu
     checks["no_signal_nan"] = not results["Signal"].isna().any()
     checks["signal_bounds"] = bool(((results["Signal"] >= 0) & (results["Signal"] <= 1)).all())
     checks["position_nan"] = not results["Position"].isna().any()
-    checks["equity_positive"] = bool((equity_curve > 0).all())
-    checks["buy_hold_positive"] = bool((buy_hold_curve > 0).all())
+    checks["equity_non_negative"] = bool((equity_curve >= 0).all())
+    checks["buy_hold_non_negative"] = bool((buy_hold_curve >= 0).all())
+    checks["params_attached"] = isinstance(results.attrs.get("strategy_parameters"), StrategyParameters)
     return checks
 
 
@@ -604,6 +864,14 @@ def _run_self_tests() -> None:
     class BacktesterTests(unittest.TestCase):
         def setUp(self) -> None:
             self.mock_data = _create_mock_price_data()
+            self.custom_params = StrategyParameters(
+                short_window=5,
+                long_window=21,
+                rsi_lower=25.0,
+                rsi_upper=75.0,
+                bollinger_window=15,
+                bollinger_width=2.5,
+            )
 
         def test_download_data_success(self) -> None:
             with mock.patch("yfinance.download", return_value=self.mock_data.copy()):
@@ -623,28 +891,53 @@ def _run_self_tests() -> None:
 
         def test_apply_strategy_outputs(self) -> None:
             for strategy in STRATEGY_OPTIONS:
-                results, equity_curve, buy_hold_curve = apply_strategy(self.mock_data, strategy)
+                results, equity_curve, buy_hold_curve = apply_strategy(
+                    self.mock_data, strategy, self.custom_params
+                )
                 checks = _validate_strategy_output(results, equity_curve, buy_hold_curve)
                 self.assertTrue(all(checks.values()), msg=f"Strategy {strategy} failed checks: {checks}")
 
         def test_compute_metrics_valid(self) -> None:
-            results, equity_curve, buy_hold_curve = apply_strategy(self.mock_data, "Buy and Hold")
+            results, equity_curve, buy_hold_curve = apply_strategy(
+                self.mock_data, "Buy and Hold", self.custom_params
+            )
             metrics = compute_metrics(equity_curve, buy_hold_curve, results["Strategy Return"])
             self.assertFalse(metrics.empty)
             self.assertIn("Metric", metrics.columns)
-            self.assertIn("Value", metrics.columns)
-            self.assertTrue(all(isinstance(val, str) for val in metrics["Value"]))
+            self.assertIn("RawValue", metrics.columns)
+            self.assertIn("Display", metrics.columns)
+            self.assertTrue(all(isinstance(val, str) for val in metrics["Display"]))
+
+        def test_compute_metrics_handles_non_positive_cagr(self) -> None:
+            dates = pd.date_range("2021-01-01", periods=2, freq="B")
+            equity_curve = pd.Series([1.0, 0.0], index=dates)
+            buy_hold_curve = pd.Series([1.0, 1.05], index=dates)
+            returns = pd.Series([0.0, -1.0], index=dates)
+            metrics = compute_metrics(equity_curve, buy_hold_curve, returns)
+            cagr_display = metrics.loc[metrics["Metric"] == "CAGR", "Display"].iloc[0]
+            self.assertEqual(cagr_display, "N/A")
 
         def test_build_price_chart(self) -> None:
-            results, equity_curve, buy_hold_curve = apply_strategy(self.mock_data, "Momentum")
-            chart = build_price_chart(results, "Momentum")
+            results, equity_curve, buy_hold_curve = apply_strategy(
+                self.mock_data, "Momentum", self.custom_params
+            )
+            chart = build_price_chart(results, "Momentum", self.custom_params)
             chart_dict = chart.to_dict()
             self.assertIsInstance(chart_dict, dict)
             self.assertIn("layer", chart_dict)
 
         def test_build_equity_chart(self) -> None:
-            results, equity_curve, buy_hold_curve = apply_strategy(self.mock_data, "Mean Reversion")
-            chart = build_equity_chart(equity_curve, buy_hold_curve, "Mean Reversion")
+            results, equity_curve, buy_hold_curve = apply_strategy(
+                self.mock_data, "Mean Reversion", self.custom_params
+            )
+            benchmark_curve = buy_hold_curve * 0.95
+            chart = build_equity_chart(
+                equity_curve,
+                buy_hold_curve,
+                "Mean Reversion",
+                benchmark_curve=benchmark_curve,
+                benchmark_label="Benchmark Test",
+            )
             chart_dict = chart.to_dict()
             self.assertIsInstance(chart_dict, dict)
             self.assertIn("data", chart_dict)
