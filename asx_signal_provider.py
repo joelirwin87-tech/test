@@ -519,12 +519,14 @@ def compute_statistics(index: pd.Index, trades: Iterable[Trade], equity_curve: p
 
 def scan_tickers(
     tickers: Iterable[str],
-    start_date: date,
+    start_date: date | datetime | pd.Timestamp,
     profit_target: float,
     win_rate_threshold: float,
     cagr_threshold: float,
     *,
-    price_fetcher: Optional[Callable[[str, date], pd.DataFrame]] = None,
+    price_fetcher: Optional[
+        Callable[[str, date | datetime | pd.Timestamp], pd.DataFrame]
+    ] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run the strategy for each ticker and build summary tables."""
 
@@ -551,7 +553,7 @@ def scan_tickers(
     signals_rows: List[Dict[str, object]] = []
     history_rows: List[Dict[str, object]] = []
 
-    for ticker in tickers:
+    for ticker in filtered_tickers:
         try:
             price_data = fetcher(ticker, start=start_date)
         except Exception as err:
