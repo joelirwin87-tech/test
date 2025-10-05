@@ -135,6 +135,7 @@ class StrategyParameters:
     momentum_window: int = 12
     mean_reversion_window: int = 20
     breakout_lookback: int = 20
+    profit_target: float = 0.05
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -162,6 +163,10 @@ def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParame
     momentum_window = max(1, int(params.momentum_window))
     mean_reversion_window = max(1, int(params.mean_reversion_window))
     breakout_lookback = max(1, int(params.breakout_lookback))
+    profit_target = max(0.0, float(params.profit_target))
+    if not np.isfinite(profit_target):
+        profit_target = 0.0
+    profit_target = min(profit_target, 10.0)
 
     return StrategyParameters(
         short_window=short_window,
@@ -173,6 +178,7 @@ def _sanitize_parameters(params: Optional[StrategyParameters]) -> StrategyParame
         momentum_window=momentum_window,
         mean_reversion_window=mean_reversion_window,
         breakout_lookback=breakout_lookback,
+        profit_target=profit_target,
     )
 
 
@@ -226,6 +232,43 @@ def _force_series(values, index) -> pd.Series:
 
     arr = np.asarray(values).ravel()
     return pd.Series(arr, index=index, dtype=float)
+
+
+def _apply_profit_target(signals: pd.Series, prices: pd.Series, profit_target: float) -> pd.Series:
+    """Adjust signals to exit positions when a profit target is hit."""
+
+    if profit_target <= 0:
+        return _force_series(signals, signals.index).astype(float)
+
+    signals = _force_series(signals, signals.index).astype(float)
+    prices = _force_series(prices, signals.index).astype(float)
+
+    position = 0
+    entry_price: Optional[float] = None
+    adjusted: List[float] = []
+
+    for sig, price in zip(signals, prices):
+        if position == 0 and sig >= 1.0:
+            position = 1
+            entry_price = price
+            adjusted.append(1.0)
+        elif position == 1:
+            if sig <= 0.0:
+                position = 0
+                entry_price = None
+                adjusted.append(0.0)
+            elif entry_price is not None and price >= entry_price * (1.0 + profit_target):
+                position = 0
+                entry_price = None
+                adjusted.append(0.0)
+            else:
+                adjusted.append(1.0)
+        else:
+            adjusted.append(0.0)
+
+    adjusted_series = pd.Series(adjusted, index=signals.index, dtype=float)
+    adjusted_series = adjusted_series.clip(lower=0.0, upper=1.0).ffill().fillna(0.0)
+    return adjusted_series.astype(float)
 
 
 def _clean_numeric_series(series: pd.Series, fill_value: float = 0.0) -> pd.Series:
@@ -394,10 +437,14 @@ def _strategy_mean_reversion(df: pd.DataFrame, params: StrategyParameters) -> Tu
     return signals, {"MeanReversionSMA": sma}
 
 
-def _strategy_golden_cross(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
+def _strategy_golden_cross(
+    df: pd.DataFrame, params: StrategyParameters
+) -> Tuple[pd.Series, Dict[str, pd.Series]]:
     sma_50 = _force_series(df["Adj Close"].rolling(window=50, min_periods=1).mean(), df.index)
     sma_200 = _force_series(df["Adj Close"].rolling(window=200, min_periods=1).mean(), df.index)
-    signals = _force_series(np.where(sma_50 > sma_200, 1.0, 0.0), df.index)
+    base_signals = _force_series(np.where(sma_50 > sma_200, 1.0, 0.0), df.index)
+    adjusted_signals = _apply_profit_target(base_signals, df["Adj Close"], params.profit_target)
+    signals = _force_series(adjusted_signals, df.index).clip(lower=0.0, upper=1.0).ffill().fillna(0.0)
     return signals, {"SMA_50": sma_50, "SMA_200": sma_200}
 
 
@@ -965,6 +1012,13 @@ def _render_app() -> None:
             breakout_lookback_input = int(
                 st.number_input("Breakout Lookback", min_value=1, max_value=252, value=20, step=1)
             )
+            profit_target_input = st.number_input(
+                "Profit Target (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=5.0,
+                step=0.5,
+            )
 
         run_backtest = st.button("Run Backtest", type="primary")
 
@@ -988,6 +1042,7 @@ def _render_app() -> None:
         momentum_window=momentum_window_input,
         mean_reversion_window=mean_reversion_window_input,
         breakout_lookback=breakout_lookback_input,
+        profit_target=profit_target_input / 100.0,
     )
     params = _sanitize_parameters(params)
 
@@ -1039,6 +1094,7 @@ def _render_app() -> None:
             st.success(f"Backtest completed for {ticker} using the {strategy_choice} strategy.")
 
             st.subheader("Price Chart & Signals")
+            st.caption(f"Profit Target: {params.profit_target * 100:.1f}%")
             st.altair_chart(build_price_chart(results, strategy_choice, params), use_container_width=True)
 
             st.subheader("Equity Curve Comparison")
@@ -1194,6 +1250,42 @@ def _run_self_tests() -> None:
                 )
                 checks = _validate_strategy_output(results, equity_curve, buy_hold_curve)
                 self.assertTrue(all(checks.values()), msg=f"Strategy {strategy} failed checks: {checks}")
+
+        def test_profit_target_triggers_exit(self) -> None:
+            dates = pd.date_range("2022-01-03", periods=300, freq="B")
+            prices = pd.Series(np.linspace(100.0, 130.0, len(dates)), index=dates)
+            synthetic = pd.DataFrame(
+                {
+                    "Open": prices,
+                    "High": prices,
+                    "Low": prices,
+                    "Close": prices,
+                    "Adj Close": prices,
+                    "Volume": 1_000.0,
+                }
+            )
+            params = StrategyParameters(profit_target=0.05)
+            results, _, _ = apply_strategy(synthetic, "Golden/Death Cross", params)
+            signals = results["Signal"].astype(float)
+            prices_series = results["Adj Close"].astype(float)
+
+            entries = signals[(signals == 1.0) & (signals.shift(1, fill_value=0.0) == 0.0)]
+            self.assertFalse(entries.empty, "Strategy never entered despite bullish data")
+            first_entry_index = entries.index[0]
+            entry_price = prices_series.loc[first_entry_index]
+
+            signal_frame = pd.DataFrame(
+                {
+                    "signal": signals,
+                    "prev": signals.shift(1, fill_value=0.0),
+                    "price": prices_series,
+                }
+            )
+            signal_frame = signal_frame.loc[first_entry_index:]
+            exits = signal_frame[(signal_frame["signal"] == 0.0) & (signal_frame["prev"] == 1.0)]
+            self.assertFalse(exits.empty, "Profit target never triggered an exit")
+            first_exit_price = exits.iloc[0]["price"]
+            self.assertGreaterEqual(first_exit_price, entry_price * 1.05 - 1e-6)
 
         def test_compute_metrics_valid(self) -> None:
             results, equity_curve, buy_hold_curve = apply_strategy(
