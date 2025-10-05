@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -254,18 +255,93 @@ def get_metadata() -> pd.DataFrame:
     return _load_metadata()
 
 
+def _call_with_optional_repair(
+    func: Callable[..., pd.DataFrame], *, args: Tuple[object, ...] = (), kwargs: Optional[Dict[str, object]] = None
+) -> pd.DataFrame:
+    """Call yfinance functions with repair fallback when supported."""
+
+    if kwargs is None:
+        kwargs = {}
+    else:
+        kwargs = dict(kwargs)
+
+    try:
+        return func(*args, repair=True, **kwargs)
+    except TypeError as err:
+        if "repair" not in str(err):
+            raise
+    return func(*args, **kwargs)
+
+
+def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
+    """Download price history with retry and fallback handling."""
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            data = _call_with_optional_repair(
+                yf.download,
+                args=(ticker,),
+                kwargs={
+                    "start": start,
+                    "progress": False,
+                    "auto_adjust": False,
+                    "rounding": True,
+                    "threads": False,
+                },
+            )
+        except Exception as err:  # pragma: no cover - network dependent
+            last_error = err
+            data = pd.DataFrame()
+
+        if not data.empty:
+            return data
+
+        time.sleep(min(2.0 * attempt, 6.0))
+
+    ticker_client = yf.Ticker(ticker)
+    try:
+        data = _call_with_optional_repair(
+            ticker_client.history,
+            kwargs={
+                "start": start,
+                "interval": "1d",
+                "auto_adjust": False,
+                "actions": False,
+            },
+        )
+    except Exception as err:  # pragma: no cover - network dependent
+        last_error = err
+        data = pd.DataFrame()
+
+    if data.empty:
+        try:
+            fallback = _call_with_optional_repair(
+                ticker_client.history,
+                kwargs={
+                    "period": "max",
+                    "interval": "1d",
+                    "auto_adjust": False,
+                    "actions": False,
+                },
+            )
+        except Exception as err:  # pragma: no cover - network dependent
+            last_error = err
+            fallback = pd.DataFrame()
+        if not fallback.empty:
+            data = fallback[fallback.index >= pd.Timestamp(start)]
+
+    if data.empty:
+        detail = f": {last_error}" if last_error else ""
+        raise ValueError(f"No data returned for {ticker}{detail}")
+
+    return data
+
+
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
     """Fetch daily OHLCV data for a ticker using yfinance."""
 
-    data = yf.download(
-        ticker,
-        start=start,
-        progress=False,
-        auto_adjust=False,
-        rounding=True,
-    )
-    if data.empty:
-        raise ValueError(f"No data returned for {ticker}")
+    data = _download_with_backoff(ticker, start)
     data = data.reset_index().rename(columns={"Date": "date"})
     data["date"] = pd.to_datetime(data["date"]).dt.tz_localize(None)
     data = data.set_index("date").sort_index()
@@ -544,6 +620,16 @@ def _format_percentage(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+def _format_percentage_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    formatted = df.copy()
+    for column in columns:
+        if column in formatted.columns:
+            formatted[column] = formatted[column].apply(
+                lambda value: _format_percentage(value) if pd.notnull(value) else value
+            )
+    return formatted
+
+
 def build_streamlit_app() -> None:
     st.set_page_config(page_title="ASX200 Daily Signals", layout="wide")
     st.title("ASX200 Daily Golden Cross Signals")
@@ -624,16 +710,15 @@ def build_streamlit_app() -> None:
     if signals_df.empty:
         st.info("No actionable signals matched the historical filters today.")
     else:
-        display_df = signals_df.copy()
-        if "historical_win_rate" in display_df.columns:
-            display_df["historical_win_rate"] = display_df["historical_win_rate"].map(_format_percentage)
-        if "historical_cagr" in display_df.columns:
-            display_df["historical_cagr"] = display_df["historical_cagr"].map(_format_percentage)
+        display_df = _format_percentage_columns(
+            signals_df, ["historical_win_rate", "historical_cagr"]
+        )
         st.dataframe(display_df)
-        csv = signals_df.to_csv(index=False).encode("utf-8")
+        csv = display_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download Signals CSV", csv, file_name="asx_signals.csv", mime="text/csv")
         excel_buffer = io.BytesIO()
-        signals_df.to_excel(excel_buffer, index=False)
+        display_df.to_excel(excel_buffer, index=False)
+        excel_buffer.seek(0)
         st.download_button(
             "Download Signals Excel",
             excel_buffer.getvalue(),
@@ -646,12 +731,12 @@ def build_streamlit_app() -> None:
         if history_df.empty:
             st.info("Run the scan to generate historical statistics.")
         else:
-            display_history = history_df.copy()
-            for col in ["win_rate", "average_return", "cagr", "max_drawdown", "total_return"]:
-                if col in display_history.columns:
-                    display_history[col] = display_history[col].apply(lambda x: _format_percentage(x) if pd.notnull(x) else x)
+            display_history = _format_percentage_columns(
+                history_df,
+                ["win_rate", "average_return", "cagr", "max_drawdown", "total_return"],
+            )
             st.dataframe(display_history)
-            csv = history_df.to_csv(index=False).encode("utf-8")
+            csv = display_history.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download Historical Stats CSV",
                 csv,
@@ -659,7 +744,8 @@ def build_streamlit_app() -> None:
                 mime="text/csv",
             )
             excel_buffer = io.BytesIO()
-            history_df.to_excel(excel_buffer, index=False)
+            display_history.to_excel(excel_buffer, index=False)
+            excel_buffer.seek(0)
             st.download_button(
                 "Download Historical Stats Excel",
                 excel_buffer.getvalue(),
@@ -794,6 +880,22 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(bad_row["total_trades"], 0.0)
         self.assertTrue(str(bad_row["status"]).startswith("Data error"))
         self.assertFalse(signals.empty)
+
+    def test_optional_repair_fallback(self):
+        calls: List[Dict[str, object]] = []
+
+        def fake_download(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if "repair" in kwargs:
+                raise TypeError("unexpected keyword argument 'repair'")
+            return pd.DataFrame({"value": [1.0]})
+
+        result = _call_with_optional_repair(fake_download, kwargs={"start": date.today()})
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertFalse(result.empty)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn("repair", calls[0])
+        self.assertNotIn("repair", calls[-1])
 
 
 class SimpleTestResult:
