@@ -204,7 +204,49 @@ def _ensure_price_columns(data: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _force_series(values, index) -> pd.Series:
+    """Coerce values into a 1D float Series aligned to the provided index."""
+
+    if not isinstance(index, pd.Index):
+        index = pd.Index(index)
+
+    if isinstance(values, pd.Series):
+        return values.reindex(index).astype(float)
+
+    if isinstance(values, pd.DataFrame):
+        if values.shape[1] != 1:
+            raise ValueError("Cannot coerce multi-column DataFrame into a Series.")
+        values = values.iloc[:, 0]
+        return values.reindex(index).astype(float)
+
+    arr = np.asarray(values)
+    if arr.ndim > 1:
+        arr = np.squeeze(arr)
+    arr = np.ravel(arr)
+
+    if arr.size == 0:
+        arr = np.full(len(index), np.nan, dtype=float)
+    elif arr.size == 1 and len(index) > 1:
+        arr = np.full(len(index), float(arr[0]), dtype=float)
+    elif arr.size != len(index):
+        padded = np.full(len(index), np.nan, dtype=float)
+        copy_len = min(arr.size, len(index))
+        if copy_len:
+            padded[:copy_len] = arr[:copy_len]
+        arr = padded
+    else:
+        arr = arr.astype(float, copy=False)
+
+    return pd.Series(arr, index=index, dtype=float)
+
+
 def _clean_numeric_series(series: pd.Series, fill_value: float = 0.0) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        if hasattr(series, "index"):
+            series = _force_series(series, series.index)
+        else:
+            raise TypeError("Input must be a pandas Series or provide an index attribute.")
+
     cleaned = series.replace([np.inf, -np.inf], np.nan)
     if fill_value is not None:
         cleaned = cleaned.fillna(fill_value)
@@ -223,7 +265,7 @@ def _compute_equity_curve(returns: pd.Series) -> pd.Series:
     factors = factors.clip(lower=1e-9)
     equity = factors.cumprod()
     equity = equity.replace([np.inf, -np.inf], np.nan).ffill().fillna(1.0)
-    return equity
+    return _force_series(equity, clean_returns.index)
 
 
 def _format_percentage(value: float) -> str:
@@ -284,30 +326,36 @@ def _strategy_buy_and_hold(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.
 
 
 def _strategy_moving_average(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
-    short = df["Adj Close"].rolling(window=params.short_window, min_periods=1).mean()
-    long = df["Adj Close"].rolling(window=params.long_window, min_periods=1).mean()
-    signals = pd.Series(np.where(short > long, 1.0, 0.0), index=df.index, dtype=float)
+    short = _force_series(
+        df["Adj Close"].rolling(window=params.short_window, min_periods=1).mean(),
+        df.index,
+    )
+    long = _force_series(
+        df["Adj Close"].rolling(window=params.long_window, min_periods=1).mean(),
+        df.index,
+    )
+    signals = _force_series(np.where(short > long, 1.0, 0.0), df.index)
     return signals, {"SMA_Short": short, "SMA_Long": long}
 
 
 def _strategy_rsi(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
     rsi_indicator = ta.momentum.RSIIndicator(close=df["Adj Close"], window=14, fillna=True)
-    rsi = rsi_indicator.rsi().clip(0, 100)
+    rsi = _force_series(rsi_indicator.rsi().clip(0, 100), df.index)
     raw_signal = np.where(
         rsi < params.rsi_lower,
         1.0,
         np.where(rsi > params.rsi_upper, 0.0, np.nan),
     )
-    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    signals = _force_series(raw_signal, df.index).ffill().fillna(0.0)
     return signals, {"RSI": rsi}
 
 
 def _strategy_macd(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
     macd_indicator = ta.trend.MACD(close=df["Adj Close"], window_slow=26, window_fast=12, window_sign=9, fillna=True)
-    macd = macd_indicator.macd()
-    macd_signal = macd_indicator.macd_signal()
-    macd_hist = macd_indicator.macd_diff()
-    signals = pd.Series(np.where(macd_hist > 0, 1.0, 0.0), index=df.index, dtype=float)
+    macd = _force_series(macd_indicator.macd(), df.index)
+    macd_signal = _force_series(macd_indicator.macd_signal(), df.index)
+    macd_hist = _force_series(macd_indicator.macd_diff(), df.index)
+    signals = _force_series(np.where(macd_hist > 0, 1.0, 0.0), df.index)
     return signals, {"MACD": macd, "MACD_Signal": macd_signal, "MACD_Hist": macd_hist}
 
 
@@ -318,45 +366,54 @@ def _strategy_bollinger(df: pd.DataFrame, params: StrategyParameters) -> Tuple[p
         window_dev=params.bollinger_width,
         fillna=True,
     )
-    middle = bb_indicator.bollinger_mavg()
-    upper = bb_indicator.bollinger_hband()
-    lower = bb_indicator.bollinger_lband()
+    middle = _force_series(bb_indicator.bollinger_mavg(), df.index)
+    upper = _force_series(bb_indicator.bollinger_hband(), df.index)
+    lower = _force_series(bb_indicator.bollinger_lband(), df.index)
     long_signal = df["Adj Close"] < lower
     flat_signal = df["Adj Close"] > upper
     raw_signal = np.where(long_signal, 1.0, np.where(flat_signal, 0.0, np.nan))
-    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    signals = _force_series(raw_signal, df.index).ffill().fillna(0.0)
     return signals, {"BB_Middle": middle, "BB_Upper": upper, "BB_Lower": lower}
 
 
 def _strategy_momentum(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
     roc_indicator = ta.momentum.ROCIndicator(close=df["Adj Close"], window=params.momentum_window, fillna=True)
-    roc = roc_indicator.roc()
-    signals = pd.Series(np.where(roc > 0, 1.0, 0.0), index=df.index, dtype=float)
+    roc = _force_series(roc_indicator.roc(), df.index)
+    signals = _force_series(np.where(roc > 0, 1.0, 0.0), df.index)
     return signals, {"ROC": roc}
 
 
 def _strategy_mean_reversion(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
-    sma = df["Adj Close"].rolling(window=params.mean_reversion_window, min_periods=1).mean()
-    signals = pd.Series(np.where(df["Adj Close"] < sma, 1.0, 0.0), index=df.index, dtype=float)
+    sma = _force_series(
+        df["Adj Close"].rolling(window=params.mean_reversion_window, min_periods=1).mean(),
+        df.index,
+    )
+    signals = _force_series(np.where(df["Adj Close"] < sma, 1.0, 0.0), df.index)
     return signals, {"MeanReversionSMA": sma}
 
 
 def _strategy_golden_cross(df: pd.DataFrame, _: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
-    sma_50 = df["Adj Close"].rolling(window=50, min_periods=1).mean()
-    sma_200 = df["Adj Close"].rolling(window=200, min_periods=1).mean()
-    signals = pd.Series(np.where(sma_50 > sma_200, 1.0, 0.0), index=df.index, dtype=float)
+    sma_50 = _force_series(df["Adj Close"].rolling(window=50, min_periods=1).mean(), df.index)
+    sma_200 = _force_series(df["Adj Close"].rolling(window=200, min_periods=1).mean(), df.index)
+    signals = _force_series(np.where(sma_50 > sma_200, 1.0, 0.0), df.index)
     return signals, {"SMA_50": sma_50, "SMA_200": sma_200}
 
 
 def _strategy_breakout(df: pd.DataFrame, params: StrategyParameters) -> Tuple[pd.Series, Dict[str, pd.Series]]:
-    high = df["High"].rolling(window=params.breakout_lookback, min_periods=1).max()
-    low = df["Low"].rolling(window=params.breakout_lookback, min_periods=1).min()
+    high = _force_series(
+        df["High"].rolling(window=params.breakout_lookback, min_periods=1).max(),
+        df.index,
+    )
+    low = _force_series(
+        df["Low"].rolling(window=params.breakout_lookback, min_periods=1).min(),
+        df.index,
+    )
     raw_signal = np.where(
         df["Close"] > high.shift(1),
         1.0,
         np.where(df["Close"] < low.shift(1), 0.0, np.nan),
     )
-    signals = pd.Series(raw_signal, index=df.index, dtype=float).ffill().fillna(0.0)
+    signals = _force_series(raw_signal, df.index).ffill().fillna(0.0)
     return signals, {"Breakout_High": high, "Breakout_Low": low}
 
 
@@ -392,10 +449,11 @@ def apply_strategy(
         raise ValueError(f"Unsupported strategy: {strategy}")
 
     signals, extra_columns = handler(df, params)
+    signals = _force_series(signals, df.index)
     signals = signals.astype(float).clip(lower=0.0, upper=1.0)
     signals = signals.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
 
-    positions = signals.shift(1).fillna(0.0)
+    positions = _force_series(signals.shift(1).fillna(0.0), df.index)
     strategy_returns = _clean_numeric_series(positions * df["Return"], fill_value=0.0)
 
     equity_curve = _compute_equity_curve(strategy_returns)
@@ -403,12 +461,12 @@ def apply_strategy(
 
     results = df.copy()
     for name, values in extra_columns.items():
-        results[name] = values
-    results["Signal"] = signals
-    results["Position"] = positions
-    results["Strategy Return"] = strategy_returns
-    results["Equity Curve"] = equity_curve
-    results["Buy & Hold Equity"] = buy_hold_curve
+        results[name] = _force_series(values, df.index)
+    results["Signal"] = _force_series(signals, df.index)
+    results["Position"] = _force_series(positions, df.index)
+    results["Strategy Return"] = _force_series(strategy_returns, df.index)
+    results["Equity Curve"] = _force_series(equity_curve, df.index)
+    results["Buy & Hold Equity"] = _force_series(buy_hold_curve, df.index)
     results.attrs["strategy_parameters"] = params
 
     return results, equity_curve, buy_hold_curve
@@ -666,7 +724,24 @@ def build_price_chart(
     price_df["Date"] = pd.to_datetime(price_df["Date"])
     price_df = price_df.replace([np.inf, -np.inf], np.nan)
     price_df = price_df.dropna(subset=["Adj Close"]).copy()
-    price_df["Position"] = price_df["Position"].fillna(0.0)
+    price_df = price_df.dropna(axis=1, how="all")
+    drop_columns: List[str] = []
+    for column_name in list(price_df.columns):
+        if column_name == "Date":
+            continue
+        column = price_df[column_name]
+        if getattr(column, "ndim", 1) != 1:
+            drop_columns.append(column_name)
+            continue
+        numeric_column = pd.to_numeric(column, errors="coerce")
+        if numeric_column.isna().all():
+            drop_columns.append(column_name)
+            continue
+        price_df[column_name] = numeric_column
+    if drop_columns:
+        price_df = price_df.drop(columns=drop_columns)
+    if "Position" in price_df.columns:
+        price_df["Position"] = price_df["Position"].fillna(0.0)
 
     base_price = (
         alt.Chart(price_df)
@@ -733,12 +808,18 @@ def build_equity_chart(
     if equity_curve.empty or buy_hold_curve.empty:
         raise ValueError("Equity curves must not be empty when building equity chart.")
 
-    curve_dict = {strategy: equity_curve, "Buy & Hold": buy_hold_curve}
+    primary_index = equity_curve.index
+    curve_dict = {
+        strategy: _force_series(equity_curve, primary_index),
+        "Buy & Hold": _force_series(buy_hold_curve, primary_index),
+    }
     if benchmark_curve is not None and not benchmark_curve.empty:
-        curve_dict[benchmark_label] = benchmark_curve
+        curve_dict[benchmark_label] = _force_series(benchmark_curve, primary_index)
 
     equity_df = pd.concat(curve_dict, axis=1)
-    equity_df = equity_df.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    equity_df = equity_df.replace([np.inf, -np.inf], np.nan)
+    equity_df = equity_df.dropna(axis=1, how="all")
+    equity_df = equity_df.dropna(how="all")
     equity_df.index = pd.to_datetime(equity_df.index)
     equity_df = equity_df.reset_index().rename(columns={"index": "Date"})
     equity_long = equity_df.melt("Date", var_name="Series", value_name="Equity")
