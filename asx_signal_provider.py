@@ -592,7 +592,7 @@ def scan_tickers(
             )
             continue
 
-        row_meta = metadata.loc[ticker] if ticker in metadata.index else None
+        row_meta = metadata_df.loc[ticker] if ticker in metadata_df.index else None
         win_rate = result.stats.get("win_rate", 0.0)
         cagr = result.stats.get("cagr", 0.0)
         meets_thresholds = win_rate >= win_rate_threshold and cagr > cagr_threshold
@@ -660,24 +660,91 @@ def build_streamlit_app() -> None:
     st.set_page_config(page_title="ASX200 Daily Signals", layout="wide")
     st.title("ASX200 Daily Golden Cross Signals")
 
-    metadata = get_metadata()
+    metadata = _empty_metadata_frame()
+    filtered_metadata = metadata
+    search_query = ""
+    search_results_limit = 25
+    lookup_query = ""
+    lookup_category = "All"
+    lookup_count = 25
+    cap_range: Optional[Tuple[float, float]] = None
+    ticker_source = "ASX200 Universe"
+    custom_ticker = ""
 
     with st.sidebar:
         st.header("Universe & Filters")
-        sectors = sorted(metadata["sector"].dropna().unique().tolist())
-        selected_sectors = st.multiselect("Sectors", options=sectors, default=sectors)
-
-        min_cap = float(metadata["market_cap_billion"].min())
-        max_cap = float(metadata["market_cap_billion"].max())
-        cap_range = st.slider(
-            "Market Cap Range (AUD billions)",
-            min_value=float(np.floor(min_cap)),
-            max_value=float(np.ceil(max_cap)),
-            value=(float(np.floor(min_cap)), float(np.ceil(max_cap))),
-            step=0.5,
+        ticker_source = st.selectbox(
+            "Ticker source",
+            options=("ASX200 Universe", "Yahoo Finance Search", "Yahoo Finance Lookup"),
+            index=0,
         )
 
-        custom_ticker = st.text_input("Custom ticker override (optional)", value="")
+        if ticker_source == "ASX200 Universe":
+            metadata = get_metadata().copy()
+            sectors = sorted(metadata["sector"].dropna().unique().tolist())
+            selected_sectors = st.multiselect(
+                "Sectors", options=sectors, default=sectors
+            )
+
+            min_cap = float(metadata["market_cap_billion"].min())
+            max_cap = float(metadata["market_cap_billion"].max())
+            cap_range = st.slider(
+                "Market Cap Range (AUD billions)",
+                min_value=float(np.floor(min_cap)),
+                max_value=float(np.ceil(max_cap)),
+                value=(float(np.floor(min_cap)), float(np.ceil(max_cap))),
+                step=0.5,
+            )
+
+            custom_ticker = st.text_input(
+                "Custom ticker override (optional)", value=""
+            )
+
+            filtered_metadata = metadata[
+                metadata["sector"].isin(selected_sectors)
+                & (metadata["market_cap_billion"] >= cap_range[0])
+                & (metadata["market_cap_billion"] <= cap_range[1])
+            ]
+        elif ticker_source == "Yahoo Finance Search":
+            search_query = st.text_input("Search query", value="").strip()
+            search_results_limit = st.slider(
+                "Max search results", min_value=5, max_value=50, value=25, step=5
+            )
+            if search_query:
+                try:
+                    metadata = search_ticker_universe(
+                        search_query, max_results=search_results_limit
+                    )
+                except RuntimeError as err:
+                    st.error(str(err))
+                    metadata = _empty_metadata_frame()
+            else:
+                st.info("Enter a search term to discover tickers via Yahoo Finance.")
+                metadata = _empty_metadata_frame()
+
+            filtered_metadata = metadata
+        else:
+            lookup_query = st.text_input("Lookup query", value="").strip()
+            lookup_category = st.selectbox(
+                "Lookup category", options=tuple(LOOKUP_CATEGORIES.keys())
+            )
+            lookup_count = st.slider(
+                "Lookup result count", min_value=5, max_value=100, value=25, step=5
+            )
+            if lookup_query:
+                try:
+                    metadata = lookup_ticker_universe(
+                        lookup_query, category=lookup_category, count=lookup_count
+                    )
+                except RuntimeError as err:
+                    st.error(str(err))
+                    metadata = _empty_metadata_frame()
+            else:
+                st.info("Enter a lookup term to discover tickers via Yahoo Finance.")
+                metadata = _empty_metadata_frame()
+
+            filtered_metadata = metadata
+
         st.header("Strategy Settings")
         profit_target = st.slider("Profit target", min_value=0.01, max_value=0.25, value=0.05, step=0.01)
         history_years = st.slider("History (years)", min_value=5, max_value=10, value=7)
@@ -686,26 +753,51 @@ def build_streamlit_app() -> None:
 
         run_button = st.button("Run Scan")
 
-    filtered_metadata = metadata[
-        metadata["sector"].isin(selected_sectors)
-        & (metadata["market_cap_billion"] >= cap_range[0])
-        & (metadata["market_cap_billion"] <= cap_range[1])
-    ]
+    if ticker_source == "ASX200 Universe":
+        if custom_ticker:
+            custom_ticker = custom_ticker.strip().upper()
+            if custom_ticker and custom_ticker not in filtered_metadata.index:
+                filtered_metadata = pd.concat(
+                    [
+                        filtered_metadata,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "ticker": custom_ticker,
+                                    "sector": "Custom",
+                                    "market_cap_billion": np.nan,
+                                }
+                            ],
+                            index=[custom_ticker],
+                        ),
+                    ]
+                )
 
-    if custom_ticker:
-        custom_ticker = custom_ticker.strip().upper()
-        if custom_ticker and custom_ticker not in filtered_metadata.index:
-            filtered_metadata = pd.concat([
-                filtered_metadata,
-                pd.DataFrame(
-                    [{"ticker": custom_ticker, "sector": "Custom", "market_cap_billion": np.nan}],
-                    index=[custom_ticker],
-                ),
-            ])
+        if cap_range is not None:
+            st.write(
+                "Scanning **{count}** tickers between {low:.1f} and {high:.1f} "
+                "billion AUD.".format(
+                    count=len(filtered_metadata), low=cap_range[0], high=cap_range[1]
+                )
+            )
+    elif ticker_source == "Yahoo Finance Search":
+        if search_query:
+            st.write(
+                f"Scanning **{len(filtered_metadata)}** tickers from Yahoo Finance Search "
+                f"results for \"{search_query}\"."
+            )
+    else:
+        if lookup_query:
+            st.write(
+                f"Scanning **{len(filtered_metadata)}** tickers from Yahoo Finance Lookup "
+                f"results for \"{lookup_query}\" ({lookup_category})."
+            )
 
-    st.write(
-        f"Scanning **{len(filtered_metadata)}** tickers between {cap_range[0]:.1f} and {cap_range[1]:.1f} billion AUD."
-    )
+    if ticker_source != "ASX200 Universe" and not filtered_metadata.empty:
+        display_columns = [
+            col for col in ["ticker", "name", "exchange", "type"] if col in filtered_metadata.columns
+        ]
+        st.dataframe(filtered_metadata.reset_index(drop=True)[display_columns])
 
     start_date = date.today() - timedelta(days=history_years * 365)
 
