@@ -844,6 +844,22 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(str(bad_row["status"]).startswith("Data error"))
         self.assertFalse(signals.empty)
 
+    def test_optional_repair_fallback(self):
+        calls: List[Dict[str, object]] = []
+
+        def fake_download(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if "repair" in kwargs:
+                raise TypeError("unexpected keyword argument 'repair'")
+            return pd.DataFrame({"value": [1.0]})
+
+        result = _call_with_optional_repair(fake_download, kwargs={"start": date.today()})
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertFalse(result.empty)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn("repair", calls[0])
+        self.assertNotIn("repair", calls[-1])
+
 
 class SimpleTestResult:
     def __init__(self, passed: bool):
