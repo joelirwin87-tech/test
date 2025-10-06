@@ -465,25 +465,30 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 
 
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
-    """Fetch daily OHLCV data for a ticker using yfinance."""
+    """Fetch daily OHLCV data for a ticker using yfinance with timezone fix."""
 
-    # Normalize to Yahoo Finance format with ".AX" suffix
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
 
-    # Direct fetch like one.py
-    df = yf.download(
-        symbol,
-        start=start,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-    )
+    try:
+        df = yf.download(
+            symbol,
+            start=start,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:  # pragma: no cover - network dependent
+        raise ValueError(f"Download failed for {symbol}: {e}")
 
     if df.empty:
         raise ValueError(f"No data returned for {symbol}")
 
-    # Match one.py formatting
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+
     df = df.reset_index()
     df = df.rename(
         columns={
@@ -496,7 +501,7 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
             "Volume": "Volume",
         }
     )
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_convert("UTC").dt.tz_localize(None)
     df = df.set_index("date").sort_index()
 
     return df
