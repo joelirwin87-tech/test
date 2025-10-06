@@ -94,20 +94,91 @@ import yfinance as yf
 
 st.set_page_config(page_title="ASX Backtester", layout="wide")
 
+DISPLAY_PREFIX = "ASX: "
+DEFAULT_EXCHANGE = "ASX"
+
+
+def _parse_ticker_parts(raw: object) -> Tuple[str, Optional[str]]:
+    if not isinstance(raw, str):
+        return "", None
+
+    sanitized = raw.strip().upper()
+    if not sanitized:
+        return "", None
+
+    if ":" in sanitized:
+        exchange, symbol = sanitized.split(":", 1)
+        return symbol.strip().replace(" ", ""), exchange.strip() or None
+
+    return sanitized.replace(" ", ""), None
+
+
+def normalize_ticker_symbol(
+    raw: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE
+) -> str:
+    symbol, exchange = _parse_ticker_parts(raw)
+    if not symbol:
+        raise ValueError("Ticker cannot be empty.")
+
+    if symbol.endswith(".AX"):
+        return symbol
+
+    resolved_exchange = (exchange or assume_exchange or "").upper()
+    if resolved_exchange == "ASX" and "." not in symbol:
+        return f"{symbol}.AX"
+
+    return symbol
+
+
+def format_display_ticker(raw: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE) -> str:
+    symbol, exchange = _parse_ticker_parts(raw)
+    if not symbol:
+        return ""
+
+    resolved_exchange = (exchange or assume_exchange or "").upper()
+    normalized = normalize_ticker_symbol(raw, assume_exchange=assume_exchange)
+
+    if normalized.endswith(".AX") and resolved_exchange == "ASX":
+        return f"{DISPLAY_PREFIX}{normalized[:-3]}"
+
+    if resolved_exchange:
+        return f"{resolved_exchange}: {symbol}"
+
+    return normalized
+
+
+def _safe_normalize_symbol(
+    value: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE
+) -> Optional[str]:
+    try:
+        return normalize_ticker_symbol(value, assume_exchange=assume_exchange)
+    except ValueError:
+        return None
+
 COMMON_TICKERS: List[str] = [
-    "BHP.AX",
-    "CBA.AX",
-    "NAB.AX",
-    "WBC.AX",
-    "ANZ.AX",
-    "CSL.AX",
-    "WES.AX",
-    "WOW.AX",
-    "FMG.AX",
-    "TLS.AX",
+    format_display_ticker(symbol)
+    for symbol in (
+        "ASX: BHP",
+        "ASX: CBA",
+        "ASX: NAB",
+        "ASX: WBC",
+        "ASX: ANZ",
+        "ASX: CSL",
+        "ASX: WES",
+        "ASX: WOW",
+        "ASX: FMG",
+        "ASX: TLS",
+    )
 ]
 
-DEFAULT_BENCHMARKS: List[str] = ["XJO.AX", "XAO.AX", "STW.AX"]
+DEFAULT_BENCHMARKS: List[str] = [
+    format_display_ticker(symbol)
+    for symbol in (
+        "ASX: XJO",
+        "ASX: XAO",
+        "ASX: STW",
+    )
+]
 
 STRATEGY_OPTIONS: List[str] = [
     "Buy and Hold",
@@ -318,10 +389,19 @@ def _safe_value(value: Optional[float]) -> float:
 
 
 def get_selected_ticker(default_choice: str, custom_input: str) -> str:
-    custom_input = custom_input.strip().upper()
+    custom_input = custom_input.strip()
     if custom_input:
-        return custom_input
-    return default_choice.strip().upper()
+        display = format_display_ticker(custom_input, assume_exchange=DEFAULT_EXCHANGE)
+        if not display:
+            raise ValueError("A ticker symbol must be provided.")
+        return display
+
+    display_default = format_display_ticker(
+        default_choice, assume_exchange=DEFAULT_EXCHANGE
+    )
+    if not display_default:
+        raise ValueError("A ticker symbol must be provided.")
+    return display_default
 
 
 def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
@@ -330,8 +410,10 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
     if start >= end:
         raise ValueError("Start date must be before end date.")
 
+    symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
+
     raw = yf.download(
-        ticker,
+        symbol,
         start=start,
         end=end + timedelta(days=1),
         progress=False,
@@ -339,7 +421,7 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
         group_by="column",
     )
     if raw.empty:
-        raise ValueError("Ticker returned no price data.")
+        raise ValueError(f"Ticker {symbol} returned no price data.")
 
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = [str(col[0]) for col in raw.columns]
@@ -351,7 +433,7 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
 
     raw = raw.dropna(how="all")
     if raw.empty:
-        raise ValueError("Ticker returned no price data.")
+        raise ValueError(f"Ticker {symbol} returned no price data.")
 
     raw.sort_index(inplace=True)
     raw.index = pd.to_datetime(raw.index)
@@ -359,7 +441,7 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
     try:
         return _ensure_price_columns(raw)
     except KeyError as exc:  # pragma: no cover - defensive
-        raise ValueError("Ticker returned no price data.") from exc
+        raise ValueError(f"Ticker {symbol} returned no price data.") from exc
 
 
 StrategyHandler = Callable[[pd.DataFrame, StrategyParameters], Tuple[pd.Series, Dict[str, pd.Series]]]
@@ -1023,14 +1105,24 @@ def _render_app() -> None:
         run_backtest = st.button("Run Backtest", type="primary")
 
     ticker = get_selected_ticker(selected_common, custom_ticker)
-    benchmark_choice = benchmark_choice.strip().upper()
-    benchmark_custom = benchmark_custom.strip().upper()
+    benchmark_choice = benchmark_choice.strip()
+    benchmark_custom = benchmark_custom.strip()
+    benchmark_ticker = ""
+
     if benchmark_custom:
-        benchmark_ticker = benchmark_custom
-    elif benchmark_choice and benchmark_choice != "NONE":
-        benchmark_ticker = benchmark_choice
-    else:
-        benchmark_ticker = ""
+        benchmark_display = format_display_ticker(
+            benchmark_custom, assume_exchange=DEFAULT_EXCHANGE
+        )
+        if benchmark_display:
+            benchmark_ticker = benchmark_display
+        else:
+            st.error("Benchmark ticker is invalid. Please check the value provided.")
+    elif benchmark_choice and benchmark_choice.lower() != "none":
+        benchmark_display = format_display_ticker(
+            benchmark_choice, assume_exchange=DEFAULT_EXCHANGE
+        )
+        if benchmark_display:
+            benchmark_ticker = benchmark_display
 
     params = StrategyParameters(
         short_window=short_window_input,
@@ -1131,10 +1223,16 @@ def _render_app() -> None:
             st.dataframe(metrics_lookup[["Display"]].rename(columns={"Display": "Value"}))
 
             export_data = _create_download_package(results, metrics_table)
+            safe_ticker_for_file = (
+                normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
+                .replace(".", "_")
+                .replace(":", "_")
+                .replace(" ", "_")
+            )
             st.download_button(
                 label="Download Results & Metrics (ZIP)",
                 data=export_data,
-                file_name=f"backtest_{ticker}_{strategy_choice.replace(' ', '_').lower()}.zip",
+                file_name=f"backtest_{safe_ticker_for_file}_{strategy_choice.replace(' ', '_').lower()}.zip",
                 mime="application/zip",
             )
 
@@ -1214,32 +1312,32 @@ def _run_self_tests() -> None:
 
         def test_download_data_success(self) -> None:
             with mock.patch("yfinance.download", return_value=self.mock_data.copy()):
-                data = download_data("BHP.AX", date(2020, 1, 1), date(2020, 12, 31))
+                data = download_data("ASX: BHP", date(2020, 1, 1), date(2020, 12, 31))
                 self.assertFalse(data.empty)
                 for col in ["Adj Close", "Close", "High", "Low"]:
                     self.assertIn(col, data.columns)
 
         def test_download_data_invalid_dates(self) -> None:
             with self.assertRaises(ValueError):
-                download_data("BHP.AX", date(2020, 1, 1), date(2020, 1, 1))
+                download_data("ASX: BHP", date(2020, 1, 1), date(2020, 1, 1))
 
         def test_download_data_empty_response(self) -> None:
             with mock.patch("yfinance.download", return_value=pd.DataFrame()):
                 with self.assertRaises(ValueError):
-                    download_data("BHP.AX", date(2020, 1, 1), date(2020, 2, 1))
+                    download_data("ASX: BHP", date(2020, 1, 1), date(2020, 2, 1))
 
         def test_download_data_handles_multiindex_columns(self) -> None:
             multiindex_data = self.mock_data.copy()
             multiindex_data.columns = pd.MultiIndex.from_product([multiindex_data.columns, ["BHP.AX"]])
             with mock.patch("yfinance.download", return_value=multiindex_data):
-                data = download_data("BHP.AX", date(2020, 1, 1), date(2020, 12, 31))
+                data = download_data("ASX: BHP", date(2020, 1, 1), date(2020, 12, 31))
                 self.assertIn("Adj Close", data.columns)
                 self.assertTrue(np.issubdtype(data["Adj Close"].dtype, np.floating))
 
         def test_download_data_creates_adj_close_from_close(self) -> None:
             without_adj = self.mock_data.drop(columns=["Adj Close"]).copy()
             with mock.patch("yfinance.download", return_value=without_adj):
-                data = download_data("BHP.AX", date(2020, 1, 1), date(2020, 12, 31))
+                data = download_data("ASX: BHP", date(2020, 1, 1), date(2020, 12, 31))
                 self.assertIn("Adj Close", data.columns)
                 self.assertTrue(np.allclose(data["Adj Close"], data["Close"]))
 

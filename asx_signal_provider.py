@@ -21,6 +21,74 @@ except Exception:  # pragma: no cover - fallback if Altair unavailable
     alt = None  # type: ignore
 
 
+DISPLAY_PREFIX = "ASX: "
+DEFAULT_EXCHANGE = "ASX"
+
+
+def _parse_ticker_parts(raw: object) -> Tuple[str, Optional[str]]:
+    """Return the symbol and exchange (if provided) from a ticker input."""
+
+    if not isinstance(raw, str):
+        return "", None
+
+    sanitized = raw.strip().upper()
+    if not sanitized:
+        return "", None
+
+    if ":" in sanitized:
+        exchange, symbol = sanitized.split(":", 1)
+        return symbol.strip().replace(" ", ""), exchange.strip() or None
+
+    return sanitized.replace(" ", ""), None
+
+
+def format_display_ticker(raw: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE) -> str:
+    """Format a ticker for UI display (e.g. ``ASX: BHP``)."""
+
+    symbol, exchange = _parse_ticker_parts(raw)
+    if not symbol:
+        return ""
+
+    resolved_exchange = (exchange or assume_exchange or "").upper()
+    normalized = normalize_ticker_symbol(raw, assume_exchange=assume_exchange)
+
+    if normalized.endswith(".AX") and resolved_exchange == "ASX":
+        return f"{DISPLAY_PREFIX}{normalized[:-3]}"
+
+    if resolved_exchange:
+        return f"{resolved_exchange}: {symbol}"
+
+    return normalized
+
+
+def normalize_ticker_symbol(
+    raw: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE
+) -> str:
+    """Convert a ticker input into a yfinance compatible symbol."""
+
+    symbol, exchange = _parse_ticker_parts(raw)
+    if not symbol:
+        raise ValueError("Ticker cannot be empty.")
+
+    if symbol.endswith(".AX"):
+        return symbol
+
+    resolved_exchange = (exchange or assume_exchange or "").upper()
+    if resolved_exchange == "ASX" and "." not in symbol:
+        return f"{symbol}.AX"
+
+    return symbol
+
+
+def _safe_normalize_symbol(
+    value: object, *, assume_exchange: Optional[str] = DEFAULT_EXCHANGE
+) -> Optional[str]:
+    try:
+        return normalize_ticker_symbol(value, assume_exchange=assume_exchange)
+    except ValueError:
+        return None
+
+
 ASX200_CSV = """ticker,name,sector,market_cap_billion
 A2M.AX,The a2 Milk Company Ltd,Consumer Staples,4.1
 ABB.AX,Austal Ltd,Industrials,1.6
@@ -243,10 +311,36 @@ def _load_metadata() -> pd.DataFrame:
     """Load ASX200 metadata from the embedded CSV."""
 
     df = pd.read_csv(io.StringIO(ASX200_CSV))
-    df["ticker"] = df["ticker"].str.strip().str.upper()
-    df["sector"] = df["sector"].str.strip()
+    df["ticker"] = df["ticker"].astype(str)
+    df["sector"] = df["sector"].astype(str).str.strip()
     df["market_cap_billion"] = pd.to_numeric(df["market_cap_billion"], errors="coerce")
-    df = df.dropna(subset=["ticker"]).drop_duplicates("ticker").set_index("ticker", drop=False)
+
+    df["symbol"] = df["ticker"].apply(
+        lambda value: _safe_normalize_symbol(value, assume_exchange=DEFAULT_EXCHANGE)
+    )
+    df = df.dropna(subset=["symbol"]).copy()
+    df["symbol"] = df["symbol"].astype(str)
+
+    if "exchange" not in df.columns:
+        df["exchange"] = DEFAULT_EXCHANGE
+    df["exchange"] = df["exchange"].fillna(DEFAULT_EXCHANGE).apply(
+        lambda value: str(value).upper() if isinstance(value, str) else DEFAULT_EXCHANGE
+    )
+
+    if "type" not in df.columns:
+        df["type"] = "Equity"
+    df["type"] = df["type"].fillna("Equity").astype(str)
+
+    df["ticker"] = df.apply(
+        lambda row: format_display_ticker(
+            row["symbol"], assume_exchange=row.get("exchange", DEFAULT_EXCHANGE)
+        ),
+        axis=1,
+    )
+    df = df.dropna(subset=["ticker"]).copy()
+    df["ticker"] = df["ticker"].astype(str)
+    df = df.drop_duplicates(subset=["symbol"]).drop_duplicates(subset=["ticker"])
+    df = df.set_index("ticker", drop=False)
     return df
 
 
@@ -260,6 +354,7 @@ def _empty_metadata_frame(columns: Optional[Iterable[str]] = None) -> pd.DataFra
 
     default_columns: Tuple[str, ...] = (
         "ticker",
+        "symbol",
         "name",
         "sector",
         "market_cap_billion",
@@ -271,6 +366,9 @@ def _empty_metadata_frame(columns: Optional[Iterable[str]] = None) -> pd.DataFra
 
     if "ticker" in frame.columns:
         frame = frame.set_index("ticker", drop=False)
+
+    if "symbol" in frame.columns:
+        frame["symbol"] = frame["symbol"].astype(str)
 
     if "market_cap_billion" in frame.columns:
         frame["market_cap_billion"] = frame["market_cap_billion"].astype(float)
@@ -377,7 +475,8 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def fetch_price_history(ticker: str, start: date) -> pd.DataFrame:
-    return _fetch_price_history_uncached(ticker, start)
+    symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
+    return _fetch_price_history_uncached(symbol, start)
 
 
 def _ensure_series(df: pd.DataFrame, column: str) -> pd.Series:
@@ -572,17 +671,75 @@ def scan_tickers(
     start_date = normalized_start
 
     metadata = get_metadata()
+    metadata_df = metadata.copy()
+    if metadata_df.empty or "ticker" not in metadata_df.columns:
+        metadata_df = _empty_metadata_frame()
+    elif metadata_df.index.name != "ticker":
+        metadata_df = metadata_df.set_index("ticker", drop=False)
+
+    if "symbol" not in metadata_df.columns and "ticker" in metadata_df.columns:
+        metadata_df["symbol"] = metadata_df["ticker"].apply(
+            lambda value: _safe_normalize_symbol(value, assume_exchange=DEFAULT_EXCHANGE)
+        )
+
     fetcher = price_fetcher or fetch_price_history
     signals_rows: List[Dict[str, object]] = []
     history_rows: List[Dict[str, object]] = []
 
+    filtered_tickers: List[str] = []
+    ticker_symbols: Dict[str, str] = {}
+    seen: set[str] = set()
+
+    for raw_ticker in tickers:
+        if not isinstance(raw_ticker, str):
+            continue
+
+        meta_symbol: Optional[str] = None
+        display_candidate = format_display_ticker(
+            raw_ticker, assume_exchange=DEFAULT_EXCHANGE
+        )
+        if not display_candidate:
+            continue
+
+        if display_candidate in metadata_df.index and "symbol" in metadata_df.columns:
+            meta_value = metadata_df.loc[display_candidate]
+            if isinstance(meta_value, pd.Series):
+                meta_symbol = meta_value.get("symbol")  # type: ignore[index]
+            else:
+                meta_symbol = meta_value.iloc[0].get("symbol")  # type: ignore[index]
+
+        symbol_candidate: Optional[str]
+        if isinstance(meta_symbol, str) and meta_symbol.strip():
+            symbol_candidate = _safe_normalize_symbol(
+                meta_symbol, assume_exchange=DEFAULT_EXCHANGE
+            )
+        else:
+            symbol_candidate = _safe_normalize_symbol(
+                raw_ticker, assume_exchange=DEFAULT_EXCHANGE
+            )
+
+        if not symbol_candidate:
+            continue
+
+        display_ticker = format_display_ticker(
+            symbol_candidate, assume_exchange=DEFAULT_EXCHANGE
+        )
+        if not display_ticker or display_ticker in seen:
+            continue
+
+        seen.add(display_ticker)
+        filtered_tickers.append(display_ticker)
+        ticker_symbols[display_ticker] = symbol_candidate
+
     for ticker in filtered_tickers:
+        symbol = ticker_symbols[ticker]
         try:
-            price_data = fetcher(ticker, start=start_date)
+            price_data = fetcher(symbol, start=start_date)
         except Exception as err:
             history_rows.append(
                 {
                     "ticker": ticker,
+                    "symbol": symbol,
                     "win_rate": 0.0,
                     "average_return": 0.0,
                     "cagr": 0.0,
@@ -602,6 +759,7 @@ def scan_tickers(
             history_rows.append(
                 {
                     "ticker": ticker,
+                    "symbol": symbol,
                     "win_rate": 0.0,
                     "average_return": 0.0,
                     "cagr": 0.0,
@@ -623,6 +781,7 @@ def scan_tickers(
         history_rows.append(
             {
                 "ticker": ticker,
+                "symbol": symbol,
                 "win_rate": win_rate,
                 "average_return": result.stats.get("average_return", 0.0),
                 "cagr": cagr,
@@ -642,6 +801,7 @@ def scan_tickers(
         signals_rows.append(
             {
                 "ticker": ticker,
+                "symbol": symbol,
                 "signal": signal,
                 "entry_price": result.entry_price,
                 "target_price": result.target_price,
@@ -776,25 +936,46 @@ def build_streamlit_app() -> None:
 
         run_button = st.button("Run Scan")
 
+    if "ticker" in filtered_metadata.columns and filtered_metadata.index.name != "ticker":
+        filtered_metadata = filtered_metadata.set_index("ticker", drop=False)
+
+    if "symbol" not in filtered_metadata.columns and not filtered_metadata.empty:
+        filtered_metadata["symbol"] = filtered_metadata["ticker"].apply(
+            lambda value: _safe_normalize_symbol(value, assume_exchange=DEFAULT_EXCHANGE)
+        )
+
     if ticker_source == "ASX200 Universe":
         if custom_ticker:
-            custom_ticker = custom_ticker.strip().upper()
-            if custom_ticker and custom_ticker not in filtered_metadata.index:
-                filtered_metadata = pd.concat(
-                    [
-                        filtered_metadata,
-                        pd.DataFrame(
-                            [
-                                {
-                                    "ticker": custom_ticker,
-                                    "sector": "Custom",
-                                    "market_cap_billion": np.nan,
-                                }
-                            ],
-                            index=[custom_ticker],
-                        ),
-                    ]
+            custom_ticker = custom_ticker.strip()
+            try:
+                custom_symbol = normalize_ticker_symbol(
+                    custom_ticker, assume_exchange=DEFAULT_EXCHANGE
                 )
+                custom_display = format_display_ticker(
+                    custom_symbol, assume_exchange=DEFAULT_EXCHANGE
+                )
+            except ValueError:
+                custom_symbol = ""
+                custom_display = ""
+                st.error("Custom ticker is invalid. Please use a valid symbol.")
+
+            if custom_display:
+                if custom_display not in filtered_metadata.index:
+                    new_row: Dict[str, object] = {
+                        "ticker": custom_display,
+                        "symbol": custom_symbol,
+                        "name": custom_display,
+                        "sector": "Custom",
+                        "market_cap_billion": np.nan,
+                        "exchange": DEFAULT_EXCHANGE,
+                        "type": "Equity",
+                    }
+                    addition = pd.DataFrame([new_row]).set_index("ticker", drop=False)
+                    filtered_metadata = pd.concat(
+                        [filtered_metadata, addition], axis=0, sort=False
+                    )
+                else:
+                    filtered_metadata.loc[custom_display, "symbol"] = custom_symbol
 
         if cap_range is not None:
             st.write(
@@ -818,7 +999,9 @@ def build_streamlit_app() -> None:
 
     if ticker_source != "ASX200 Universe" and not filtered_metadata.empty:
         display_columns = [
-            col for col in ["ticker", "name", "exchange", "type"] if col in filtered_metadata.columns
+            col
+            for col in ["ticker", "symbol", "name", "exchange", "type"]
+            if col in filtered_metadata.columns
         ]
         st.dataframe(filtered_metadata.reset_index(drop=True)[display_columns])
 
@@ -1039,7 +1222,7 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(filtered.empty)
 
     def test_scan_handles_fetch_error(self):
-        tickers = ["GOOD.AX", "BAD.AX"]
+        tickers = ["ASX: GOOD", "ASX: BAD"]
 
         def fake_fetch(ticker: str, start: date) -> pd.DataFrame:
             if ticker == "BAD.AX":
@@ -1055,11 +1238,12 @@ class StrategyTests(unittest.TestCase):
             price_fetcher=fake_fetch,
         )
 
-        self.assertIn("BAD.AX", history["ticker"].values)
-        bad_row = history.loc[history["ticker"] == "BAD.AX"].iloc[0]
+        self.assertIn("ASX: BAD", history["ticker"].values)
+        bad_row = history.loc[history["ticker"] == "ASX: BAD"].iloc[0]
         self.assertEqual(bad_row["win_rate"], 0.0)
         self.assertEqual(bad_row["total_trades"], 0.0)
         self.assertTrue(str(bad_row["status"]).startswith("Data error"))
+        self.assertEqual(bad_row["symbol"], "BAD.AX")
         self.assertFalse(signals.empty)
 
     def test_optional_repair_fallback(self):
