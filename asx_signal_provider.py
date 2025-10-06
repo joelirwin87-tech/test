@@ -15,6 +15,17 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+try:  # pragma: no cover - compatibility with older yfinance versions
+    from yfinance import exceptions as yf_exceptions
+except Exception:  # pragma: no cover - fallback when exceptions module missing
+    class _YFExceptionsFallback:
+        """Fallback container for yfinance exceptions when unavailable."""
+
+        class YFTzMissingError(Exception):
+            """Raised when a timezone cannot be determined for a ticker."""
+
+    yf_exceptions = _YFExceptionsFallback()  # type: ignore
+
 try:  # pragma: no cover - optional dependency for charts
     import altair as alt
 except Exception:  # pragma: no cover - fallback if Altair unavailable
@@ -465,29 +476,52 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 
 
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
-    """Fetch daily OHLCV data for a ticker using yfinance."""
+    """Fetch daily OHLCV data for a ticker using yfinance with timezone fix."""
 
-    # Normalize to Yahoo Finance format with ".AX" suffix
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
 
-    # Direct fetch like one.py
-    df = yf.download(
-        symbol,
-        start=start,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-    )
+    try:
+        df = yf.download(
+            symbol,
+            start=start,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except yf_exceptions.YFTzMissingError as err:  # pragma: no cover - network dependent
+        ticker_client = yf.Ticker(symbol)
+        df = ticker_client.history(
+            start=start,
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            raise_errors=False,
+        )
+        if df.empty:
+            raise ValueError(
+                "Download failed for "
+                f"{symbol}: timezone unavailable and fallback returned no data"
+            ) from err
+    except Exception as err:  # pragma: no cover - network dependent
+        raise ValueError(f"Download failed for {symbol}: {err}") from err
 
     if df.empty:
         raise ValueError(f"No data returned for {symbol}")
 
-    # Match one.py formatting
-    df = df.reset_index()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError(f"Unexpected index type for {symbol}: {type(df.index).__name__}")
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+
+    df.index = df.index.tz_localize(None)
+    df.index.name = "date"
+
     df = df.rename(
         columns={
-            "Date": "date",
             "Open": "Open",
             "High": "High",
             "Low": "Low",
@@ -496,8 +530,7 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
             "Volume": "Volume",
         }
     )
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
-    df = df.set_index("date").sort_index()
+    df = df.sort_index()
 
     return df
 
@@ -882,6 +915,9 @@ def build_streamlit_app() -> None:
     cap_range: Optional[Tuple[float, float]] = None
     ticker_source = "ASX200 Universe"
     custom_ticker = ""
+    custom_symbol: str = ""
+    custom_display: str = ""
+    custom_override_active = False
 
     with st.sidebar:
         st.header("Universe & Filters")
@@ -908,9 +944,25 @@ def build_streamlit_app() -> None:
                 step=0.5,
             )
 
-            custom_ticker = st.text_input(
+            custom_input = st.text_input(
                 "Custom ticker override (optional)", value=""
             )
+            custom_ticker = custom_input.strip()
+            custom_symbol = ""
+            custom_display = ""
+            custom_override_active = False
+            if custom_ticker:
+                try:
+                    custom_symbol = normalize_ticker_symbol(
+                        custom_ticker, assume_exchange=DEFAULT_EXCHANGE
+                    )
+                    custom_display = format_display_ticker(
+                        custom_symbol, assume_exchange=DEFAULT_EXCHANGE
+                    )
+                    custom_override_active = True
+                except ValueError:
+                    st.error("Custom ticker is invalid. Please use a valid symbol.")
+                    custom_ticker = ""
 
             filtered_metadata = metadata[
                 metadata["sector"].isin(selected_sectors)
@@ -974,39 +1026,27 @@ def build_streamlit_app() -> None:
         )
 
     if ticker_source == "ASX200 Universe":
-        if custom_ticker:
-            custom_ticker = custom_ticker.strip()
-            try:
-                custom_symbol = normalize_ticker_symbol(
-                    custom_ticker, assume_exchange=DEFAULT_EXCHANGE
+        if custom_override_active and custom_display:
+            if custom_display not in filtered_metadata.index:
+                new_row: Dict[str, object] = {
+                    "ticker": custom_display,
+                    "symbol": custom_symbol,
+                    "name": custom_display,
+                    "sector": "Custom",
+                    "market_cap_billion": np.nan,
+                    "exchange": DEFAULT_EXCHANGE,
+                    "type": "Equity",
+                }
+                addition = pd.DataFrame([new_row]).set_index("ticker", drop=False)
+                filtered_metadata = pd.concat(
+                    [filtered_metadata, addition], axis=0, sort=False
                 )
-                custom_display = format_display_ticker(
-                    custom_symbol, assume_exchange=DEFAULT_EXCHANGE
-                )
-            except ValueError:
-                custom_symbol = ""
-                custom_display = ""
-                st.error("Custom ticker is invalid. Please use a valid symbol.")
+            else:
+                filtered_metadata.loc[custom_display, "symbol"] = custom_symbol
 
-            if custom_display:
-                if custom_display not in filtered_metadata.index:
-                    new_row: Dict[str, object] = {
-                        "ticker": custom_display,
-                        "symbol": custom_symbol,
-                        "name": custom_display,
-                        "sector": "Custom",
-                        "market_cap_billion": np.nan,
-                        "exchange": DEFAULT_EXCHANGE,
-                        "type": "Equity",
-                    }
-                    addition = pd.DataFrame([new_row]).set_index("ticker", drop=False)
-                    filtered_metadata = pd.concat(
-                        [filtered_metadata, addition], axis=0, sort=False
-                    )
-                else:
-                    filtered_metadata.loc[custom_display, "symbol"] = custom_symbol
-
-        if cap_range is not None:
+        if custom_override_active and custom_display:
+            st.write(f"Scanning custom ticker **{custom_display}**.")
+        elif cap_range is not None:
             st.write(
                 "Scanning **{count}** tickers between {low:.1f} and {high:.1f} "
                 "billion AUD.".format(
@@ -1041,6 +1081,19 @@ def build_streamlit_app() -> None:
         for ticker in filtered_metadata["ticker"].tolist()
         if isinstance(ticker, str) and ticker.strip()
     ]
+
+    if custom_override_active:
+        if custom_symbol:
+            tickers_to_scan = [custom_symbol]
+        else:
+            try:
+                custom_symbol = normalize_ticker_symbol(
+                    custom_ticker, assume_exchange=DEFAULT_EXCHANGE
+                )
+                tickers_to_scan = [custom_symbol]
+            except ValueError:
+                st.error("Invalid custom ticker format.")
+                tickers_to_scan = []
 
     scan_params = {
         "tickers": tuple(tickers_to_scan),
