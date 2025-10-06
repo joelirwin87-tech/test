@@ -155,64 +155,24 @@ def _safe_normalize_symbol(
     except ValueError:
         return None
 
-
-def _call_with_optional_repair(
-    func: Callable[..., pd.DataFrame],
-    *,
-    args: Optional[Iterable[object]] = None,
-    kwargs: Optional[Dict[str, object]] = None,
-) -> pd.DataFrame:
-    """Invoke a yfinance download that may support the ``repair`` flag."""
-
-    call_args = tuple(args or ())
-    base_kwargs = dict(kwargs or {})
-
-    if "repair" not in base_kwargs:
-        repair_kwargs = dict(base_kwargs)
-        repair_kwargs["repair"] = True
-        try:
-            return func(*call_args, **repair_kwargs)
-        except TypeError as exc:
-            if "repair" not in str(exc).lower():
-                raise
-
-    return func(*call_args, **base_kwargs)
-
-
-def _build_download_kwargs(start: date, end: date) -> Dict[str, object]:
-    return {
-        "start": start,
-        "end": end,
-        "interval": "1d",
-        "auto_adjust": False,
-        "progress": False,
-        "threads": True,
-        "rounding": True,
-    }
-
 COMMON_TICKERS: List[str] = [
     format_display_ticker(symbol)
     for symbol in (
-        "ASX: BHP",
-        "ASX: CBA",
-        "ASX: NAB",
-        "ASX: WBC",
-        "ASX: ANZ",
-        "ASX: CSL",
-        "ASX: WES",
-        "ASX: WOW",
-        "ASX: FMG",
-        "ASX: TLS",
+        "BHP.AX",
+        "CBA.AX",
+        "NAB.AX",
+        "WBC.AX",
+        "ANZ.AX",
+        "CSL.AX",
+        "WES.AX",
+        "WOW.AX",
+        "FMG.AX",
+        "TLS.AX",
     )
 ]
 
 DEFAULT_BENCHMARKS: List[str] = [
-    format_display_ticker(symbol)
-    for symbol in (
-        "ASX: XJO",
-        "ASX: XAO",
-        "ASX: STW",
-    )
+    format_display_ticker(symbol) for symbol in ("XJO.AX", "XAO.AX", "STW.AX")
 ]
 
 STRATEGY_OPTIONS: List[str] = [
@@ -446,11 +406,14 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
         raise ValueError("Start date must be before end date.")
 
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
-    end_inclusive = end + timedelta(days=1)
-    raw = _call_with_optional_repair(
-        yf.download,
-        args=(symbol,),
-        kwargs=_build_download_kwargs(start, end_inclusive),
+
+    raw = yf.download(
+        symbol,
+        start=start,
+        end=end + timedelta(days=1),
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
     )
     if raw.empty:
         raise ValueError(f"Ticker {symbol} returned no price data.")
