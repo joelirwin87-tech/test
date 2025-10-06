@@ -7,6 +7,7 @@ import sys
 import unittest
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -31,8 +32,20 @@ except Exception:  # pragma: no cover - fallback if Altair unavailable
     alt = None  # type: ignore
 
 
+logger = logging.getLogger(__name__)
+
 DISPLAY_PREFIX = "ASX: "
 DEFAULT_EXCHANGE = "ASX"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+HISTORY_COLUMNS: Tuple[str, ...] = (
+    "Date",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adj Close",
+    "Volume",
+)
 
 
 def _parse_ticker_parts(raw: object) -> Tuple[str, Optional[str]]:
@@ -1254,6 +1267,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             raise SystemExit(1)
         return
 
+    initialize_local_data()
     build_streamlit_app()
 
 
