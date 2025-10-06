@@ -406,22 +406,31 @@ def _call_with_optional_repair(
     return func(*call_args, **base_kwargs)
 
 
+def _build_download_kwargs(start: date) -> Dict[str, object]:
+    """Return consistent keyword arguments for Yahoo Finance downloads."""
+
+    return {
+        "start": start,
+        "interval": "1d",
+        "auto_adjust": False,
+        "progress": False,
+        "threads": True,
+        "rounding": True,
+    }
+
+
 def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
     """Download price history with retry and fallback handling."""
 
     last_error: Optional[Exception] = None
+    download_kwargs = _build_download_kwargs(start)
+
     for attempt in range(1, attempts + 1):
         try:
             data = _call_with_optional_repair(
                 yf.download,
                 args=(ticker,),
-                kwargs={
-                    "start": start,
-                    "progress": False,
-                    "auto_adjust": False,
-                    "rounding": True,
-                    "threads": False,
-                },
+                kwargs=download_kwargs,
             )
         except Exception as err:  # pragma: no cover - network dependent
             last_error = err
@@ -434,7 +443,7 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 
     ticker_client = yf.Ticker(ticker)
     try:
-        data = ticker_client.history(start=start, interval="1d", auto_adjust=False, actions=False)
+        data = ticker_client.history(interval="1d", auto_adjust=False, actions=False, start=start)
     except Exception as err:  # pragma: no cover - network dependent
         last_error = err
         data = pd.DataFrame()
