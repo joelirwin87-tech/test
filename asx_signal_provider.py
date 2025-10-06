@@ -489,37 +489,18 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
             progress=False,
             threads=True,
         )
-    except yf_exceptions.YFTzMissingError as err:  # pragma: no cover - network dependent
-        ticker_client = yf.Ticker(symbol)
-        df = ticker_client.history(
-            start=start,
-            interval="1d",
-            auto_adjust=False,
-            actions=False,
-            raise_errors=False,
-        )
-        if df.empty:
-            raise ValueError(
-                "Download failed for "
-                f"{symbol}: timezone unavailable and fallback returned no data"
-            ) from err
-    except Exception as err:  # pragma: no cover - network dependent
-        raise ValueError(f"Download failed for {symbol}: {err}") from err
+    except Exception as e:  # pragma: no cover - network dependent
+        raise ValueError(f"Download failed for {symbol}: {e}")
 
     if df.empty:
         raise ValueError(f"No data returned for {symbol}")
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError(f"Unexpected index type for {symbol}: {type(df.index).__name__}")
 
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
 
-    df.index = df.index.tz_localize(None)
-    df.index.name = "date"
-
+    df = df.reset_index()
     df = df.rename(
         columns={
             "Open": "Open",
@@ -530,7 +511,8 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
             "Volume": "Volume",
         }
     )
-    df = df.sort_index()
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_convert("UTC").dt.tz_localize(None)
+    df = df.set_index("date").sort_index()
 
     return df
 
