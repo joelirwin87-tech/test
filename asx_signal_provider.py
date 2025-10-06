@@ -8,12 +8,14 @@ import time
 import unittest
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import logging
 
 try:  # pragma: no cover - compatibility with older yfinance versions
     from yfinance import exceptions as yf_exceptions
@@ -32,8 +34,20 @@ except Exception:  # pragma: no cover - fallback if Altair unavailable
     alt = None  # type: ignore
 
 
+logger = logging.getLogger(__name__)
+
 DISPLAY_PREFIX = "ASX: "
 DEFAULT_EXCHANGE = "ASX"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+HISTORY_COLUMNS: Tuple[str, ...] = (
+    "Date",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adj Close",
+    "Volume",
+)
 
 
 def _parse_ticker_parts(raw: object) -> Tuple[str, Optional[str]]:
@@ -430,6 +444,161 @@ def _build_download_kwargs(start: date) -> Dict[str, object]:
     }
 
 
+def _normalize_history_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    working = frame.copy()
+
+    if "Date" in working.columns:
+        working["Date"] = pd.to_datetime(working["Date"], utc=True, errors="coerce").dt.tz_localize(None)
+    else:
+        if not isinstance(working.index, pd.DatetimeIndex):
+            working.index = pd.to_datetime(working.index, errors="coerce")
+        working = working.reset_index().rename(columns={"index": "Date", "Date": "Date"})
+        working["Date"] = pd.to_datetime(working["Date"], utc=True, errors="coerce").dt.tz_localize(None)
+
+    working = working.dropna(subset=["Date"])
+
+    for column in HISTORY_COLUMNS[1:]:
+        if column in working.columns:
+            working[column] = pd.to_numeric(working[column], errors="coerce")
+        else:
+            working[column] = np.nan
+
+    working = working[list(HISTORY_COLUMNS)]
+    working = working.dropna(subset=["Date"]).sort_values("Date")
+    working = working.drop_duplicates(subset=["Date"], keep="last")
+    working.reset_index(drop=True, inplace=True)
+    return working
+
+
+def _write_local_history(symbol: str, frame: pd.DataFrame) -> None:
+    normalized = _normalize_history_frame(frame)
+    if normalized.empty:
+        logger.warning("Skipping save for %s: no data to persist", symbol)
+        return
+
+    DATA_DIR.mkdir(exist_ok=True)
+    output_path = DATA_DIR / f"{symbol}.csv"
+    normalized.to_csv(output_path, index=False)
+
+
+def _download_full_history(symbol: str) -> pd.DataFrame:
+    try:
+        data = _call_with_optional_repair(
+            yf.download,
+            args=(symbol,),
+            kwargs={
+                "period": "max",
+                "interval": "1d",
+                "auto_adjust": False,
+                "progress": False,
+                "threads": True,
+                "rounding": True,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Full download failed for %s: %s", symbol, exc)
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    return _normalize_history_frame(data)
+
+
+def _download_incremental_history(symbol: str, start_date: date) -> pd.DataFrame:
+    if start_date > date.today():
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    try:
+        data = _call_with_optional_repair(
+            yf.download,
+            args=(symbol,),
+            kwargs=_build_download_kwargs(start_date),
+        )
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Incremental download failed for %s: %s", symbol, exc)
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    return _normalize_history_frame(data)
+
+
+def _ensure_symbol_up_to_date(symbol: str, today: date) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    path = DATA_DIR / f"{symbol}.csv"
+
+    if not path.exists():
+        history = _download_full_history(symbol)
+        if not history.empty:
+            _write_local_history(symbol, history)
+        else:
+            logger.warning("No historical data available for %s", symbol)
+        return
+
+    try:
+        stored = pd.read_csv(path, parse_dates=["Date"])
+    except Exception as exc:  # pragma: no cover - unexpected file issues
+        logger.warning("Failed reading cached data for %s: %s", symbol, exc)
+        stored = pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    normalized = _normalize_history_frame(stored)
+    if normalized.empty:
+        history = _download_full_history(symbol)
+        if history.empty:
+            logger.warning("No historical data available for %s after retry", symbol)
+            return
+        _write_local_history(symbol, history)
+        return
+
+    last_date = normalized["Date"].iloc[-1].date()
+    if last_date >= today:
+        _write_local_history(symbol, normalized)
+        return
+
+    next_date = last_date + timedelta(days=1)
+    if next_date > today:
+        next_date = today
+
+    incremental = _download_incremental_history(symbol, next_date)
+    if incremental.empty:
+        logger.info("No new rows downloaded for %s", symbol)
+        _write_local_history(symbol, normalized)
+        return
+
+    combined = pd.concat([normalized, incremental], ignore_index=True)
+    combined = _normalize_history_frame(combined)
+    _write_local_history(symbol, combined)
+
+
+def _load_local_history(symbol: str) -> pd.DataFrame:
+    path = DATA_DIR / f"{symbol}.csv"
+    if not path.exists():
+        return pd.DataFrame(columns=HISTORY_COLUMNS[1:]).set_index(
+            pd.DatetimeIndex([], name="Date")
+        )
+
+    stored = pd.read_csv(path, parse_dates=["Date"])
+    normalized = _normalize_history_frame(stored)
+    if normalized.empty:
+        return pd.DataFrame(columns=HISTORY_COLUMNS[1:]).set_index(
+            pd.DatetimeIndex([], name="Date")
+        )
+
+    normalized = normalized.set_index("Date")
+    normalized.index = pd.to_datetime(normalized.index).tz_localize(None)
+    return normalized
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_local_data() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    metadata = get_metadata()
+    today = date.today()
+    for symbol in metadata["symbol"].dropna().unique():
+        try:
+            _ensure_symbol_up_to_date(symbol, today)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.warning("Failed to update %s: %s", symbol, exc)
+
 def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
     """Download price history with retry and fallback handling."""
 
@@ -476,45 +645,23 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 
 
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
-    """Fetch daily OHLCV data for a ticker using yfinance with timezone fix."""
+    """Fetch daily OHLCV data for a ticker from the local CSV cache."""
 
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
+    initialize_local_data()
 
-    try:
-        df = yf.download(
-            symbol,
-            start=start,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:  # pragma: no cover - network dependent
-        raise ValueError(f"Download failed for {symbol}: {e}")
+    history = _load_local_history(symbol)
+    if history.empty:
+        raise ValueError(f"No cached data available for {symbol}")
 
-    if df.empty:
-        raise ValueError(f"No data returned for {symbol}")
+    history = history.sort_index()
+    start_timestamp = pd.Timestamp(start)
+    filtered = history[history.index >= start_timestamp]
 
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
+    if filtered.empty:
+        raise ValueError(f"No data available for {symbol} from {start}")
 
-    df = df.reset_index()
-    df = df.rename(
-        columns={
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Adj Close": "Adj Close",
-            "Volume": "Volume",
-        }
-    )
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df.set_index("date").sort_index()
-
-    return df
+    return filtered
 
 
 @st.cache_data(show_spinner=False)
@@ -1349,6 +1496,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             raise SystemExit(1)
         return
 
+    initialize_local_data()
     build_streamlit_app()
 
 
