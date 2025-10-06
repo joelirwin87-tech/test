@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import io
 import sys
-import time
 import unittest
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -13,7 +12,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
+from price_history import fetch_price_history as load_price_history
 
 try:  # pragma: no cover - compatibility with older yfinance versions
     from yfinance import exceptions as yf_exceptions
@@ -417,110 +416,16 @@ def _call_with_optional_repair(
     return func(*call_args, **base_kwargs)
 
 
-def _build_download_kwargs(start: date) -> Dict[str, object]:
-    """Return consistent keyword arguments for Yahoo Finance downloads."""
-
-    return {
-        "start": start,
-        "interval": "1d",
-        "auto_adjust": False,
-        "progress": False,
-        "threads": True,
-        "rounding": True,
-    }
-
-
-def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd.DataFrame:
-    """Download price history with retry and fallback handling."""
-
-    last_error: Optional[Exception] = None
-    download_kwargs = _build_download_kwargs(start)
-
-    for attempt in range(1, attempts + 1):
-        try:
-            data = _call_with_optional_repair(
-                yf.download,
-                args=(ticker,),
-                kwargs=download_kwargs,
-            )
-        except Exception as err:  # pragma: no cover - network dependent
-            last_error = err
-            data = pd.DataFrame()
-
-        if not data.empty:
-            return data
-
-        time.sleep(min(2.0 * attempt, 6.0))
-
-    ticker_client = yf.Ticker(ticker)
-    try:
-        data = ticker_client.history(interval="1d", auto_adjust=False, actions=False, start=start)
-    except Exception as err:  # pragma: no cover - network dependent
-        last_error = err
-        data = pd.DataFrame()
-
-    if data.empty:
-        try:
-            fallback = ticker_client.history(period="max", interval="1d", auto_adjust=False, actions=False)
-        except Exception as err:  # pragma: no cover - network dependent
-            last_error = err
-            fallback = pd.DataFrame()
-        if not fallback.empty:
-            data = fallback[fallback.index >= pd.Timestamp(start)]
-
-    if data.empty:
-        detail = f": {last_error}" if last_error else ""
-        raise ValueError(f"No data returned for {ticker}{detail}")
-
-    return data
-
-
-def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
-    """Fetch daily OHLCV data for a ticker using yfinance with timezone fix."""
-
-    symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
-
-    try:
-        df = yf.download(
-            symbol,
-            start=start,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:  # pragma: no cover - network dependent
-        raise ValueError(f"Download failed for {symbol}: {e}")
-
-    if df.empty:
-        raise ValueError(f"No data returned for {symbol}")
-
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-
-    df = df.reset_index()
-    df = df.rename(
-        columns={
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Adj Close": "Adj Close",
-            "Volume": "Volume",
-        }
-    )
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df.set_index("date").sort_index()
-
-    return df
-
-
 @st.cache_data(show_spinner=False)
 def fetch_price_history(ticker: str, start: date) -> pd.DataFrame:
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
-    return _fetch_price_history_uncached(symbol, start)
+    data = load_price_history(symbol, start)
+    if data.empty:
+        raise ValueError(f"No data returned for {symbol}")
+    frame = data.copy()
+    frame.index = pd.to_datetime(frame.index)
+    frame.sort_index(inplace=True)
+    return frame
 
 
 def _ensure_series(df: pd.DataFrame, column: str) -> pd.Series:
