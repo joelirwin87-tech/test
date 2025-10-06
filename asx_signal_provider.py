@@ -467,19 +467,39 @@ def _download_with_backoff(ticker: str, start: date, *, attempts: int = 3) -> pd
 def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
     """Fetch daily OHLCV data for a ticker using yfinance."""
 
-    data = _download_with_backoff(ticker, start)
-    data = data.reset_index().rename(columns={"Date": "date"})
-    data["date"] = pd.to_datetime(data["date"]).dt.tz_localize(None)
-    data = data.set_index("date").sort_index()
-    for column in ["Open", "High", "Low", "Close", "Adj Close"]:
-        if column in data.columns:
-            data[column] = pd.to_numeric(data[column], errors="coerce")
-    if "Adj Close" not in data.columns or data["Adj Close"].isna().all():
-        data["Adj Close"] = data["Close"]
-    data["Adj Close"] = data["Adj Close"].fillna(data["Close"])
-    data["Volume"] = pd.to_numeric(data.get("Volume"), errors="coerce").fillna(0)
-    data = data[[col for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if col in data.columns]]
-    return data
+    # Normalize to Yahoo Finance format with ".AX" suffix
+    symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
+
+    # Direct fetch like one.py
+    df = yf.download(
+        symbol,
+        start=start,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+    )
+
+    if df.empty:
+        raise ValueError(f"No data returned for {symbol}")
+
+    # Match one.py formatting
+    df = df.reset_index()
+    df = df.rename(
+        columns={
+            "Date": "date",
+            "Open": "Open",
+            "High": "High",
+            "Low": "Low",
+            "Close": "Close",
+            "Adj Close": "Adj Close",
+            "Volume": "Volume",
+        }
+    )
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    df = df.set_index("date").sort_index()
+
+    return df
 
 
 @st.cache_data(show_spinner=False)
