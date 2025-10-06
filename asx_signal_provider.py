@@ -15,6 +15,17 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+try:  # pragma: no cover - compatibility with older yfinance versions
+    from yfinance import exceptions as yf_exceptions
+except Exception:  # pragma: no cover - fallback when exceptions module missing
+    class _YFExceptionsFallback:
+        """Fallback container for yfinance exceptions when unavailable."""
+
+        class YFTzMissingError(Exception):
+            """Raised when a timezone cannot be determined for a ticker."""
+
+    yf_exceptions = _YFExceptionsFallback()  # type: ignore
+
 try:  # pragma: no cover - optional dependency for charts
     import altair as alt
 except Exception:  # pragma: no cover - fallback if Altair unavailable
@@ -492,7 +503,6 @@ def _fetch_price_history_uncached(ticker: str, start: date) -> pd.DataFrame:
     df = df.reset_index()
     df = df.rename(
         columns={
-            "Date": "date",
             "Open": "Open",
             "High": "High",
             "Low": "Low",
