@@ -89,7 +89,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import ta
-import yfinance as yf
+from price_history import fetch_price_history
 
 
 st.set_page_config(page_title="ASX Backtester", layout="wide")
@@ -407,30 +407,15 @@ def download_data(ticker: str, start: date, end: date) -> pd.DataFrame:
 
     symbol = normalize_ticker_symbol(ticker, assume_exchange=DEFAULT_EXCHANGE)
 
-    raw = yf.download(
-        symbol,
-        start=start,
-        end=end + timedelta(days=1),
-        progress=False,
-        auto_adjust=False,
-        group_by="column",
-    )
+    raw = fetch_price_history(symbol, start)
+    raw = raw[(raw.index >= pd.Timestamp(start)) & (raw.index <= pd.Timestamp(end))]
     if raw.empty:
         raise ValueError(f"Ticker {symbol} returned no price data.")
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [str(col[0]) for col in raw.columns]
-
-    raw.columns = [str(column) for column in raw.columns]
-
-    if "Adj Close" not in raw.columns and "Close" in raw.columns:
-        raw["Adj Close"] = raw["Close"]
 
     raw = raw.dropna(how="all")
     if raw.empty:
         raise ValueError(f"Ticker {symbol} returned no price data.")
 
-    raw.sort_index(inplace=True)
     raw.index = pd.to_datetime(raw.index)
 
     try:
